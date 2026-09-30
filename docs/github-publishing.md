@@ -12,10 +12,10 @@
 
 ```powershell
 python scripts/publish_github.py --check-auth
-python scripts/publish_github.py --repository QubitSequencer --visibility public
+python scripts/publish_github.py --repository QubitSequencer --visibility private
 ```
 
-发布为私有仓库时将 `public` 改为 `private`。组织仓库可增加 `--owner 组织名称`，需要账号有相应权限。
+当前使用私有仓库。公开发布时将 `private` 改为 `public`；已有仓库的可见性需先在 GitHub 设置中更改，脚本不会自动切换。组织仓库可增加 `--owner 组织名称`，需要账号有相应权限。
 
 脚本创建仓库，推送 `main` 和版本标签，然后先创建草稿 Release；上传 Windows ZIP、使用说明 PDF 和 `SHA256SUMS.txt` 并核对结果后发布。已有仓库中的不同提交和已发布的同名版本不会被覆盖。
 

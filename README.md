@@ -14,7 +14,9 @@
 
 ## Windows 发布版
 
-下载发布压缩包并完整解压，双击 `QubitSequencer.exe`。请保留 `_internal` 文件夹和 EXE 的相对位置。
+从 [GitHub Releases](https://github.com/Wonder0225/QubitSequencer/releases/latest) 下载发布压缩包并完整解压，双击 `QubitSequencer.exe`。请保留 `_internal` 文件夹和 EXE 的相对位置。
+
+当前仓库为私有仓库，源码和发布文件需使用有访问权限的 GitHub 账号查看。
 
 通过“文件 > 打开 .qchip”打开随包附带的 `examples/surface_d3_complete.qchip`，查看完整 d=3 模拟项目。实际芯片文件请另存到发布目录以外。
 
