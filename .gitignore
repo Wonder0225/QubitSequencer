@@ -1,0 +1,25 @@
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+*.qchip-journal
+*.qchip-wal
+*.qchip-shm
+.build_deps/
+*.egg-info/
+build/
+dist/
+.env
+.env.*
+# Local chip projects and recovered user data are not release examples.
+projects/
+*.qchip
+!examples/square_lattice.qchip
+!examples/surface_d3.qchip
+!examples/surface_d3_complete.qchip
+*.qchip.*
+# Windows bundles belong in GitHub Releases; retain the published PDF manual.
+output/*
+!output/pdf/
+output/pdf/*
+!output/pdf/user-guide.pdf
