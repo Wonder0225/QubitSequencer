@@ -92,7 +92,18 @@ def _upgrade_1_to_2(db: sqlite3.Connection) -> None:
         raise ValueError("Migration completed with foreign key violations; restore backup")
 
 
-MIGRATIONS = {1: _upgrade_1_to_2}
+def _upgrade_2_to_3(db: sqlite3.Connection) -> None:
+    from .attachment_store import ATTACHMENT_STATEMENTS
+    with db:
+        db.execute("BEGIN IMMEDIATE")
+        for statement in ATTACHMENT_STATEMENTS:
+            db.execute(statement)
+        if db.execute("PRAGMA foreign_key_check").fetchone():
+            raise ValueError("附件格式升级失败：外键检查未通过")
+        db.execute("PRAGMA user_version=3")
+
+
+MIGRATIONS = {1: _upgrade_1_to_2, 2: _upgrade_2_to_3}
 
 
 def migrate(path: str | Path) -> Path | None:

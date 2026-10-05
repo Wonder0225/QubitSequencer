@@ -176,7 +176,7 @@ class StoreTests(unittest.TestCase):
         """)
         db.close()
         with ChipStore.open(self.path) as store:
-            self.assertEqual(store.db.execute("PRAGMA user_version").fetchone()[0], 2)
+            self.assertEqual(store.db.execute("PRAGMA user_version").fetchone()[0], 3)
             self.assertEqual(len(store.links()), 2)
             by_qubit = {link["qubit_id"]: link["id"] for link in store.links()}
             self.assertEqual(store.current_values("idle")[(by_qubit["q1"], "link.g_qc")], 12)

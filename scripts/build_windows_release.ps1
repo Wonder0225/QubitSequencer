@@ -1,6 +1,6 @@
 $ErrorActionPreference = 'Stop'
 $projectRoot = (Resolve-Path (Join-Path $PSScriptRoot '..')).Path
-$releaseVersion = '0.2.1'
+$releaseVersion = '0.3.1'
 $buildStamp = Get-Date -Format 'yyyyMMdd-HHmmss'
 $distPath = Join-Path $projectRoot "output/release/builds/$releaseVersion-$buildStamp"
 Set-Location -LiteralPath $projectRoot
@@ -37,7 +37,11 @@ Copy-Item -LiteralPath 'examples/surface_d3_complete_preview.png' -Destination $
 Copy-Item -LiteralPath 'examples/surface_d3_complete_topology.png' -Destination $examples -Force
 Copy-Item -LiteralPath 'examples/surface_d3_complete_dark_preview.png' -Destination $examples -Force
 Copy-Item -LiteralPath 'examples/surface_d3_complete_dark_qubit_f01.png' -Destination $examples -Force
+Copy-Item -LiteralPath 'examples/surface_d3_complete_dark_wiring_ports.png' -Destination $examples -Force
+Copy-Item -LiteralPath 'examples/surface_d3_complete_dark_coupling_g_effective.png' -Destination $examples -Force
 Copy-Item -LiteralPath 'docs/release-readme.md' -Destination (Join-Path $release 'README.md') -Force
+Copy-Item -LiteralPath 'docs/user-guide.md' -Destination $release -Force
+Copy-Item -LiteralPath 'docs/images' -Destination $release -Recurse -Force
 Copy-Item -LiteralPath 'output/pdf/user-guide.pdf' -Destination $release -Force
 Copy-Item -LiteralPath 'THIRD_PARTY_NOTICES.md' -Destination $release -Force
 Copy-Item -LiteralPath 'licenses' -Destination $release -Recurse -Force

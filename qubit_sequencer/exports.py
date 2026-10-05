@@ -9,7 +9,7 @@ from openpyxl import Workbook
 from openpyxl.styles import Alignment, Font, PatternFill
 from openpyxl.utils import get_column_letter
 
-from .storage import ChipStore, SCHEMA_VERSION
+from .storage import ChipStore, SCHEMA_VERSION, display_timestamp
 
 
 def _header(definition) -> str:
@@ -27,7 +27,7 @@ def build_tables(store: ChipStore, point: str = "default",
     tables: dict[str, tuple[list[str], list[list[object]]]] = {
         "芯片信息": (["项目", "值"], [
             ["芯片名称", meta["chip_name"]], ["模板", meta["template"]],
-            ["创建时间", meta["created_at"]], ["导出工作点", point],
+            ["创建时间", display_timestamp(meta["created_at"])], ["导出工作点", point],
             ["格式版本", SCHEMA_VERSION],
         ])
     }
@@ -84,7 +84,7 @@ def build_tables(store: ChipStore, point: str = "default",
                 definition["key"], definition["label"], definition["unit"],
                 record["numeric_value"] if record["numeric_value"] is not None else record["text_value"],
                 record["point"], record["bias_value"], record["bias_unit"],
-                record["observed_at"], record["source"], record["notes"],
+                display_timestamp(record["observed_at"]), record["source"], record["notes"],
                 "是" if record["is_current"] else "否",
             ])
         tables["参数历史"] = (["对象 ID", "对象", "参数键", "参数名", "单位", "值", "工作点",

@@ -170,6 +170,107 @@ class DiagramTests(unittest.TestCase):
             self.assertIn("<sub>1</sub>", window.device_popup.title.text())
             window.close()
 
+    def test_custom_identities_remain_visible_after_click_fit_and_resize(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "roles.qchip"
+            with ChipStore.create(path, "身份图例", "custom") as store:
+                store.set_meta("grid_columns", "1000")
+                a = store.add_device("qubit", "fixed_transmon", "Q_{1}", 0, 0, role="readout")
+                b = store.add_device("qubit", "fixed_transmon", "Q_{2}", 2, 1, role="ancilla")
+                c = store.add_device("coupler", "tunable_coupler", "C_{12}", 1, .5)
+                store.add_link(a, c)
+                store.add_link(b, c)
+            window = MainWindow(str(path))
+            window.set_theme("dark", persist=False)
+            window.show()
+            self.app.processEvents()
+            window.fit_diagram()
+
+            def check_footer():
+                labels = {item.toPlainText() for item in window.scene.items()
+                          if hasattr(item, "toPlainText")}
+                self.assertIn("● readout", labels)
+                self.assertIn("● ancilla", labels)
+                self.assertNotIn("● 比特", labels)
+                self.assertLess(window.scene.content_rect.width(), 1000)
+                self.assertGreater(window.scene.footer_item.sceneBoundingRect().top(),
+                                   window.scene.body_rect.bottom())
+                visible = window.view.mapToScene(window.view.viewport().rect()).boundingRect()
+                for item in window.scene._legend_items:
+                    self.assertTrue(visible.contains(item.sceneBoundingRect()))
+
+            check_footer()
+            for ident in (a, c, b):
+                center = window.scene._device_items[ident].sceneBoundingRect().center()
+                QTest.mouseClick(window.view.viewport(), Qt.MouseButton.LeftButton,
+                                 pos=window.view.mapFromScene(center))
+                QTest.qWait(420)
+                window.device_popup.close()
+                self.app.processEvents()
+                check_footer()
+            window.resize(960, 650)
+            self.app.processEvents()
+            self.app.processEvents()
+            check_footer()
+            window.view.zoom_by(1.5)
+            window.fit_diagram()
+            check_footer()
+            window.store.update_device(b, role="spectator")
+            window.refresh_content()
+            labels = {item.toPlainText() for item in window.scene.items()
+                      if hasattr(item, "toPlainText")}
+            self.assertIn("● spectator", labels)
+            self.assertNotIn("● ancilla", labels)
+            window.field_combo.setCurrentIndex(window.field_combo.findData("device.role"))
+            self.app.processEvents()
+            role_text = [item.toPlainText() for item in window.scene.items()
+                         if hasattr(item, "toPlainText") and item.data(0) == ("device", b)]
+            self.assertEqual(role_text, ["spectator"])
+            window.close()
+
+    def test_port_labels_are_readable_and_preserve_all_ports(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            with ChipStore.create(Path(tmp) / "ports.qchip", "接线排版", "custom") as store:
+                qid = store.add_device("qubit", "fixed_transmon", "Q_1", 0, 0)
+                cid = store.add_device("coupler", "tunable_coupler", "C_1", .5, .5)
+                store.add_link(qid, cid)
+                for port in ("XY-01", "Z-01", "RD-01"):
+                    store.add_line("XY", "DR-A", port, devices=[qid])
+                store.add_line("Z", "DR-A", "CFLUX-01", devices=[cid])
+                for theme in ("light", "dark"):
+                    scene = ChipScene(store, "wiring.port", theme=theme)
+                    labels = {item.data(0)[1]: item for item in scene.items()
+                              if hasattr(item, "toPlainText") and item.data(0)}
+                    self.assertCountEqual(labels[qid].toPlainText().splitlines(), ["XY-01", "Z-01", "RD-01"])
+                    self.assertEqual(labels[cid].toPlainText().replace("\n", ""), "CFLUX-01")
+                    for label in labels.values():
+                        self.assertGreaterEqual(label.font().pointSizeF() * label.scale(), 9)
+                        self.assertTrue(scene.content_rect.contains(label.sceneBoundingRect()))
+                    self.assertTrue(scene._device_items[qid].sceneBoundingRect().contains(labels[qid].sceneBoundingRect()))
+                    self.assertFalse(scene._device_items[cid].sceneBoundingRect().intersects(labels[cid].sceneBoundingRect()))
+
+    def test_coupling_values_avoid_glyphs_and_other_values(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            with ChipStore.create(Path(tmp) / "coupling.qchip", "耦合排版", "surface") as store:
+                rotated_surface_code(store, 3, "coupler")
+                for index, coupling in enumerate(store.couplings()):
+                    store.set_parameter(coupling["id"], "coupling.g_effective", 7.6 + index * .65)
+                for index, link in enumerate(store.links()):
+                    store.set_parameter(link["id"], "link.g_qc", 35 + index * .75)
+                for field, kind, objects in (("coupling.g_effective", "coupling", store.couplings()),
+                                             ("link.g_qc", "link", store.links())):
+                    scene = ChipScene(store, field)
+                    labels = [item for item in scene.items() if hasattr(item, "toPlainText")
+                              and item.data(0) and item.data(0)[0] == kind]
+                    self.assertEqual(len(labels), len(objects))
+                    for index, label in enumerate(labels):
+                        rect = label.sceneBoundingRect()
+                        self.assertTrue(scene.content_rect.contains(rect))
+                        for glyph in scene._device_items.values():
+                            self.assertFalse(rect.intersects(glyph.sceneBoundingRect()))
+                        for other in labels[index + 1:]:
+                            self.assertFalse(rect.intersects(other.sceneBoundingRect()))
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -17,7 +17,7 @@ from reportlab.lib.styles import ParagraphStyle
 from reportlab.pdfbase import pdfmetrics
 from reportlab.pdfbase.ttfonts import TTFont
 from reportlab.platypus import (
-    Image, KeepTogether, Paragraph, Preformatted, SimpleDocTemplate, Spacer, Table,
+    Image, KeepTogether, PageBreak, Paragraph, Preformatted, SimpleDocTemplate, Spacer, Table,
     TableStyle,
 )
 
@@ -35,6 +35,8 @@ def register_fonts() -> None:
     if font is None:
         raise FileNotFoundError("No Chinese TTF font available for PDF generation")
     pdfmetrics.registerFont(TTFont("GuideCJK", str(font)))
+    pdfmetrics.registerFontFamily("GuideCJK", normal="GuideCJK", bold="GuideCJK",
+                                 italic="GuideCJK", boldItalic="GuideCJK")
 
 
 def inline_markup(source: str) -> str:
@@ -50,8 +52,8 @@ def build() -> Path:
     OUTPUT.parent.mkdir(parents=True, exist_ok=True)
     text = SOURCE.read_text(encoding="utf-8")
     normal = ParagraphStyle(
-        "Body", fontName="GuideCJK", fontSize=9.3, leading=16,
-        textColor=colors.HexColor("#233247"), spaceAfter=8,
+        "Body", fontName="GuideCJK", fontSize=9.6, leading=16.7,
+        textColor=colors.HexColor("#20252E"), spaceAfter=8, wordWrap="CJK",
     )
     normal_keep = ParagraphStyle("BodyKeep", parent=normal, keepWithNext=True)
     title = ParagraphStyle(
@@ -114,6 +116,10 @@ def build() -> Path:
         if not line:
             flush_paragraph()
             continue
+        if line == "<!-- pagebreak -->":
+            flush_paragraph()
+            story.append(PageBreak())
+            continue
         image_match = re.fullmatch(r"!\[([^]]+)\]\(([^)]+)\)", line)
         if image_match:
             flush_paragraph()
@@ -121,7 +127,8 @@ def build() -> Path:
             if not image_path.is_file():
                 raise FileNotFoundError(image_path)
             picture = Image(str(image_path))
-            max_height = 150 if image_path.name == "data-table.png" else 235
+            max_height = (220 if image_path.name.startswith("recent-files")
+                          else 280 if image_path.name.startswith("device-popup") else 310)
             scale = min((A4[0] - 96) / picture.imageWidth, max_height / picture.imageHeight)
             picture.drawWidth = picture.imageWidth * scale
             picture.drawHeight = picture.imageHeight * scale
@@ -150,7 +157,7 @@ def build() -> Path:
         canvas.line(48, A4[1] - 40, A4[0] - 48, A4[1] - 40)
         canvas.setFont("GuideCJK", 8)
         canvas.setFillColor(colors.HexColor("#627890"))
-        canvas.drawString(48, A4[1] - 31, "Qubit Sequencer · 用户手册")
+        canvas.drawString(48, A4[1] - 31, "Qubit Sequencer · 0.3.1 用户手册")
         canvas.drawRightString(A4[0] - 48, 30, f"{doc.page}")
         canvas.restoreState()
 

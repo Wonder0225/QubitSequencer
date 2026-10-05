@@ -10,16 +10,37 @@ import json
 import math
 import sqlite3
 from contextlib import closing
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from uuid import uuid4
+from .attachment_store import AttachmentStore, AttachmentInput, AttachmentChange, ATTACHMENT_SCHEMA
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 FORMAT_NAME = "qchip"
+BEIJING = timezone(timedelta(hours=8), "UTC+08:00")
 
 
 def utc_now() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+def beijing_now() -> str:
+    return datetime.now(BEIJING).isoformat(timespec="seconds")
+
+
+def beijing_timestamp(value: str) -> str:
+    """Normalize explicit offsets; offset-free input means Beijing local time."""
+    instant = datetime.fromisoformat(value.strip())
+    if instant.tzinfo is None:
+        instant = instant.replace(tzinfo=BEIJING)
+    return instant.astimezone(BEIJING).isoformat()
+
+
+def display_timestamp(value: str) -> str:
+    """Read legacy timestamps without rewriting stored history or losing text."""
+    try:
+        return beijing_timestamp(value)
+    except (TypeError, ValueError):
+        return value
 
 
 def new_id() -> str:
@@ -28,29 +49,29 @@ def new_id() -> str:
 
 # key, label, owner scope, category, value type, canonical display unit
 PRESETS = [
-    ("qubit.f01", "比特频率 f01", "qubit", "measured", "number", "GHz"),
+    ("qubit.f01", "比特频率 f_{10}", "qubit", "measured", "number", "GHz"),
     ("qubit.anharmonicity", "非谐", "qubit", "measured", "number", "MHz"),
     ("qubit.readout_frequency", "读取频率", "qubit", "measured", "number", "GHz"),
     ("qubit.readout_power", "读取功率", "qubit", "measured", "number", "dBm"),
-    ("qubit.t1", "T1", "qubit", "measured", "number", "µs"),
-    ("qubit.t2_star", "Ramsey T2*", "qubit", "measured", "number", "µs"),
-    ("qubit.t2_echo", "Echo T2", "qubit", "measured", "number", "µs"),
-    ("qubit.design_f01", "设计频率 f01", "qubit", "design", "number", "GHz"),
-    ("qubit.ej_over_h", "EJ/h", "qubit", "design", "number", "GHz"),
-    ("qubit.ec_over_h", "EC/h", "qubit", "design", "number", "GHz"),
-    ("qubit.c_sigma", "总电容 CΣ", "qubit", "design", "number", "fF"),
-    ("qubit.ic", "结临界电流 Ic", "qubit", "design", "number", "nA"),
+    ("qubit.t1", "T_{1}", "qubit", "measured", "number", "µs"),
+    ("qubit.t2_star", "Ramsey T_{2}^{*}", "qubit", "measured", "number", "µs"),
+    ("qubit.t2_echo", "Echo T_{2}", "qubit", "measured", "number", "µs"),
+    ("qubit.design_f01", "设计频率 f_{10}", "qubit", "design", "number", "GHz"),
+    ("qubit.ej_over_h", "E_{J}/h", "qubit", "design", "number", "GHz"),
+    ("qubit.ec_over_h", "E_{C}/h", "qubit", "design", "number", "GHz"),
+    ("qubit.c_sigma", r"总电容 C_{\Sigma}", "qubit", "design", "number", "fF"),
+    ("qubit.ic", "结临界电流 I_{c}", "qubit", "design", "number", "nA"),
     ("qubit.junction_asymmetry", "结不对称度", "qubit", "design", "number", ""),
-    ("coupler.f01", "耦合器频率 f01", "coupler", "measured", "number", "GHz"),
+    ("coupler.f01", "耦合器频率 f_{10}", "coupler", "measured", "number", "GHz"),
     ("coupler.anharmonicity", "耦合器非谐", "coupler", "measured", "number", "MHz"),
-    ("coupler.t1", "耦合器 T1", "coupler", "measured", "number", "µs"),
-    ("coupler.t2_star", "耦合器 Ramsey T2*", "coupler", "measured", "number", "µs"),
-    ("coupler.t2_echo", "耦合器 Echo T2", "coupler", "measured", "number", "µs"),
-    ("coupler.design_f01", "耦合器设计频率", "coupler", "design", "number", "GHz"),
-    ("coupler.ej_over_h", "耦合器 EJ/h", "coupler", "design", "number", "GHz"),
-    ("coupler.ec_over_h", "耦合器 EC/h", "coupler", "design", "number", "GHz"),
-    ("coupler.c_sigma", "耦合器总电容 CΣ", "coupler", "design", "number", "fF"),
-    ("coupler.ic", "耦合器结临界电流 Ic", "coupler", "design", "number", "nA"),
+    ("coupler.t1", "耦合器 T_{1}", "coupler", "measured", "number", "µs"),
+    ("coupler.t2_star", "耦合器 Ramsey T_{2}^{*}", "coupler", "measured", "number", "µs"),
+    ("coupler.t2_echo", "耦合器 Echo T_{2}", "coupler", "measured", "number", "µs"),
+    ("coupler.design_f01", "耦合器设计频率 f_{10}", "coupler", "design", "number", "GHz"),
+    ("coupler.ej_over_h", "耦合器 E_{J}/h", "coupler", "design", "number", "GHz"),
+    ("coupler.ec_over_h", "耦合器 E_{C}/h", "coupler", "design", "number", "GHz"),
+    ("coupler.c_sigma", r"耦合器总电容 C_{\Sigma}", "coupler", "design", "number", "fF"),
+    ("coupler.ic", "耦合器结临界电流 I_{c}", "coupler", "design", "number", "nA"),
     ("coupler.junction_asymmetry", "耦合器结不对称度", "coupler", "design", "number", ""),
     ("coupling.g_direct", "直接耦合强度", "coupling", "measured", "number", "MHz"),
     ("coupling.g_effective", "有效比特耦合强度", "coupling", "measured", "number", "MHz"),
@@ -58,6 +79,26 @@ PRESETS = [
     ("link.g_qc", "比特-耦合器强度", "link", "measured", "number", "MHz"),
     ("link.c_design", "比特-耦合器设计电容", "link", "design", "number", "fF"),
 ]
+
+# Read old built-in labels through a projection. IDs, keys, values and customized
+# labels remain in the original file; no schema or historical-data rewrite.
+LEGACY_LABELS = {
+    "qubit.f01": "比特频率 f01", "qubit.design_f01": "设计频率 f01",
+    "qubit.t1": "T1", "qubit.t2_star": "Ramsey T2*", "qubit.t2_echo": "Echo T2",
+    "qubit.ej_over_h": "EJ/h", "qubit.ec_over_h": "EC/h",
+    "qubit.c_sigma": "总电容 CΣ", "qubit.ic": "结临界电流 Ic",
+    "coupler.f01": "耦合器频率 f01", "coupler.design_f01": "耦合器设计频率",
+    "coupler.t1": "耦合器 T1", "coupler.t2_star": "耦合器 Ramsey T2*",
+    "coupler.t2_echo": "耦合器 Echo T2", "coupler.ej_over_h": "耦合器 EJ/h",
+    "coupler.ec_over_h": "耦合器 EC/h", "coupler.c_sigma": "耦合器总电容 CΣ",
+    "coupler.ic": "耦合器结临界电流 Ic",
+}
+_PRESET_LABELS = {row[0]: row[1] for row in PRESETS}
+_LABEL_CASE = "CASE " + " ".join(
+    f"WHEN is_custom=0 AND key='{key}' AND label='{old}' THEN '{_PRESET_LABELS[key]}'"
+    for key, old in LEGACY_LABELS.items()
+) + " ELSE label END AS label"
+_DEFINITION_COLUMNS = f"key,{_LABEL_CASE},scope,category,value_type,unit,is_custom"
 
 SCHEMA = """
 CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
@@ -131,7 +172,10 @@ CREATE TABLE attachments (
 """
 
 
-class ChipStore:
+SCHEMA += ATTACHMENT_SCHEMA
+
+
+class ChipStore(AttachmentStore):
     def __init__(self, path: str | Path, connection: sqlite3.Connection):
         self.path = Path(path)
         self.db = connection
@@ -151,7 +195,7 @@ class ChipStore:
             db.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
             db.executemany("INSERT INTO meta(key,value) VALUES (?,?)", [
                 ("format", FORMAT_NAME), ("chip_name", name), ("template", template),
-                ("created_at", utc_now()),
+                ("created_at", beijing_now()),
             ])
             db.executemany(
                 "INSERT INTO parameter_definitions VALUES (?,?,?,?,?,?,0)", PRESETS
@@ -224,7 +268,7 @@ class ChipStore:
         ident = new_id()
         with self.db:
             self.db.execute("INSERT INTO devices VALUES (?,?,?,?,?,?,?,?,?,?,?)",
-                            (ident, kind, subtype, label.strip(), role, x, y, 0, 0, notes, utc_now()))
+                            (ident, kind, subtype, label.strip(), role, x, y, 0, 0, notes, beijing_now()))
         return ident
 
     def update_device(self, ident: str, **changes: object) -> None:
@@ -291,7 +335,7 @@ class ChipStore:
         ident = new_id()
         with self.db:
             self.db.execute("INSERT INTO couplings VALUES (?,?,?,?,?,?,?)",
-                            (ident, q1, q2, mode, coupler_id, notes, utc_now()))
+                            (ident, q1, q2, mode, coupler_id, notes, beijing_now()))
             if coupler_id:
                 self._ensure_link(q1, coupler_id)
                 self._ensure_link(q2, coupler_id)
@@ -304,7 +348,7 @@ class ChipStore:
             return row[0]
         ident = new_id()
         self.db.execute("INSERT INTO links VALUES (?,?,?,?,?)",
-                        (ident, qubit_id, coupler_id, "", utc_now()))
+                        (ident, qubit_id, coupler_id, "", beijing_now()))
         return ident
 
     def add_link(self, qubit_id: str, coupler_id: str, notes: str = "") -> str:
@@ -318,7 +362,7 @@ class ChipStore:
         ident = new_id()
         with self.db:
             self.db.execute("INSERT INTO links VALUES (?,?,?,?,?)",
-                            (ident, qubit_id, coupler_id, notes, utc_now()))
+                            (ident, qubit_id, coupler_id, notes, beijing_now()))
             if len(existing) == 1:
                 other = existing[0]["qubit_id"]
                 a, b = sorted((other, qubit_id))
@@ -327,7 +371,7 @@ class ChipStore:
                     (a, b, coupler_id),
                 ).fetchone():
                     self.db.execute("INSERT INTO couplings VALUES (?,?,?,?,?,?,?)",
-                                    (new_id(), a, b, "coupler", coupler_id, "", utc_now()))
+                                    (new_id(), a, b, "coupler", coupler_id, "", beijing_now()))
         return ident
 
     def link(self, ident: str) -> sqlite3.Row:
@@ -441,12 +485,12 @@ class ChipStore:
         ordering = "ORDER BY CASE category WHEN 'measured' THEN 0 WHEN 'design' THEN 1 ELSE 2 END, key"
         if scope:
             return self.db.execute(
-                f"SELECT * FROM parameter_definitions WHERE scope=? {ordering}", (scope,)
+                f"SELECT {_DEFINITION_COLUMNS} FROM parameter_definitions WHERE scope=? {ordering}", (scope,)
             ).fetchall()
-        return self.db.execute(f"SELECT * FROM parameter_definitions {ordering},scope").fetchall()
+        return self.db.execute(f"SELECT {_DEFINITION_COLUMNS} FROM parameter_definitions {ordering},scope").fetchall()
 
     def definition(self, key: str) -> sqlite3.Row:
-        row = self.db.execute("SELECT * FROM parameter_definitions WHERE key=?", (key,)).fetchone()
+        row = self.db.execute(f"SELECT {_DEFINITION_COLUMNS} FROM parameter_definitions WHERE key=?", (key,)).fetchone()
         if row is None:
             raise KeyError(key)
         return row
@@ -454,7 +498,7 @@ class ChipStore:
     def set_parameter(self, owner_id: str, key: str, value: float | str | None,
                       point: str = "default", bias_value: float | None = None,
                       bias_unit: str = "", observed_at: str | None = None,
-                      source: str = "", notes: str = "") -> str:
+                      source: str = "", notes: str = "", attachments=()) -> str:
         definition = self.definition(key)
         if not point.strip():
             raise ValueError("working point required")
@@ -485,6 +529,7 @@ class ChipStore:
                 text = str(value)
         if bias_value is not None and not math.isfinite(float(bias_value)):
             raise ValueError("bias must be finite")
+        timestamp = beijing_timestamp(observed_at) if observed_at is not None else beijing_now()
         ident = new_id()
         with self.db:
             self.db.execute(
@@ -497,7 +542,10 @@ class ChipStore:
                  numeric_value,text_value,observed_at,source,notes,is_current)
                  VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,1)""",
                 (ident, key, device_id, coupling_id, link_id, point, bias_value, bias_unit,
-                 numeric, text, observed_at or utc_now(), source, notes),
+                 numeric, text, timestamp, source, notes),
+            )
+            self._apply_attachment_changes(
+                ident, (AttachmentChange(content=payload) for payload in attachments)
             )
         return ident
 
@@ -513,7 +561,7 @@ class ChipStore:
         if point is not None:
             query += " AND point=?"
             args.append(point)
-        query += " ORDER BY observed_at DESC,id DESC"
+        query += " ORDER BY julianday(observed_at) DESC,id DESC"
         return self.db.execute(query, args).fetchall()
 
     def current_values(self, point: str = "default") -> dict[tuple[str, str], object]:
@@ -534,7 +582,7 @@ class ChipStore:
         with self.db:
             self.db.execute("INSERT INTO calibration_records VALUES (?,?,?,?,?,?,?,?)",
                             (ident, owner_id if device else None, owner_id if coupling else None,
-                             experiment_type, utc_now(), point, json.dumps(fit_result), notes))
+                             experiment_type, beijing_now(), point, json.dumps(fit_result), notes))
         return ident
 
     def add_attachment(self, calibration_id: str, file_name: str,
@@ -572,4 +620,7 @@ class ChipStore:
         for link in self.links():
             if self.device(link["qubit_id"])["kind"] != "qubit" or self.device(link["coupler_id"])["kind"] != "coupler":
                 issues.append(f"Invalid qubit-coupler link: {link['id']}")
+        for blob in self.db.execute("SELECT sha256,byte_size,data FROM attachment_blobs"):
+            if len(blob["data"]) != blob["byte_size"] or hashlib.sha256(blob["data"]).hexdigest() != blob["sha256"]:
+                issues.append(f"Attachment checksum mismatch: {blob['sha256']}")
         return issues

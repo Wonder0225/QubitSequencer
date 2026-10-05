@@ -1,4 +1,4 @@
-# Third-party components in the Windows 0.2.1 bundle
+# Third-party components in the Windows 0.3.1 bundle
 
 Qubit Sequencer uses the following third-party software. These components retain
 their own copyrights and licenses independently of the application's license.

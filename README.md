@@ -1,24 +1,27 @@
 # Qubit Sequencer 芯片登记
 
-用于登记超导量子芯片的逻辑构型、比特/耦合器参数、耦合关系和制冷机接线的本机桌面程序。芯片项目保存为单个 `.qchip` 文件。
+用于登记超导量子芯片的逻辑构型、比特/耦合器参数、耦合关系和制冷机接线的本机桌面程序。芯片项目保存为单个 `.qchip` 文件。当前源码版本为 **0.3.1**。
 
-![深色模式界面](examples/surface_d3_complete_dark_preview.png)
+![0.3.1 深色科研工作台](docs/images/dark-mode.png)
 
 ## 功能
 
-- 可扩展正方格子、旋转表面码阵列和自定义构型，支持鼠标缩放及适配芯片。
-- 可调/不可调 Transmon、直接电容耦合与固定/可调耦合器，以及独立的比特—耦合器连接。
-- 带单位的参数、自定义字段、工作点、历史记录及制冷机接线登记。
-- 点击元件弹出编辑窗口；标签与参数表支持简单 TeX 上下标；数据表可横向或纵向显示。
-- 导出 XLSX、多份 CSV、PNG/SVG 构型图和参数图；支持深色模式。
+- 顶部项目栏提供新建、打开、备份、全局工作点、导出与主题切换；左侧导航在芯片构型、参数数据表、制冷机接线和参数历史之间切换。
+- 可扩展正方格子、旋转表面码阵列和自定义构型，支持滚轮缩放、拖动平移及适配芯片。
+- 可调/固定 Transmon、直接电容耦合、固定/可调耦合器，以及独立的比特-耦合器物理连接。
+- 详情面板和器件弹窗共用编辑草稿；保存更改写入文件，取消更改恢复已保存值，关闭弹窗保留草稿。离开文件时可保存全部、放弃或取消。
+- 带单位的参数、自定义字段、工作点、历史记录及制冷机接线登记。参数和线路操作确认后立即写入文件。
+- 标签与参数表支持简单 TeX 上下标；数据表可横向或纵向显示，表头和单元格提示保留完整名称、单位及原值。
+- 文件菜单支持最近项目，Ctrl+R 打开可搜索列表；最多保留 20 项，跨启动保留。
+- 频率显示名采用 `f_{10}`，图层中比特参数优先、耦合器参数置后；新记录使用北京时间，旧 UTC 历史按同一时刻换算显示和导出。
+- 参数登记可附加图片、代码、文本等文件，支持拖入与粘贴图像。附件内嵌至芯片文件，历史页提供预览、编辑、替换、可恢复移除及版本恢复。
+- 导出 XLSX、多份 CSV、PNG/SVG 构型图和参数图；明暗主题采用统一矢量图标和清晰的选中、焦点及禁用状态。
 
 ## Windows 发布版
 
 从 [GitHub Releases](https://github.com/Wonder0225/QubitSequencer/releases/latest) 下载发布压缩包并完整解压，双击 `QubitSequencer.exe`。请保留 `_internal` 文件夹和 EXE 的相对位置。
 
-当前仓库为私有仓库，源码和发布文件需使用有访问权限的 GitHub 账号查看。
-
-通过“文件 > 打开 .qchip”打开随包附带的 `examples/surface_d3_complete.qchip`，查看完整 d=3 模拟项目。实际芯片文件请另存到发布目录以外。
+当前仓库为私有仓库，源码和发布文件需使用有访问权限的 GitHub 账号查看。打开随包附带的 `examples/surface_d3_complete.qchip` 可查看完整 d=3 模拟项目。实际芯片文件请保存到发布目录以外。
 
 ## 启动
 
@@ -29,56 +32,43 @@ python -m pip install -e .
 python -m qubit_sequencer
 ```
 
-已有文件可直接打开：
+直接打开已有文件，或生成并校验芯片：
 
 ```powershell
 python -m qubit_sequencer gui examples/surface_d3_complete.qchip
-```
-
-生成和校验示例文件：
-
-```powershell
 python -m qubit_sequencer sample my_chip.qchip --template surface --mode coupler
 python -m qubit_sequencer validate my_chip.qchip
 ```
 
-当前格式为 v2。旧 v1 文件打开时会自动备份并迁移，也可手动执行 `python -m qubit_sequencer migrate my_chip.qchip`。
+当前源码及 Windows 0.3.1 发布版使用 v3 文件格式。旧 v1/v2 文件打开时会自动备份并迁移，也可执行 `python -m qubit_sequencer migrate my_chip.qchip`。迁移后的 v3 文件须使用当前版本打开。当前 PDF 随发布版保留，新增附件操作见 Markdown 使用说明；Windows 包也附带最新的 `user-guide.md` 和说明图片。
 
-## 文档
+## 文档与示例
 
-- [中文使用说明](docs/user-guide.md)
-- [`.qchip` 格式规范 v2](docs/qchip-format-v2.md)
+- [中文使用说明](docs/user-guide.md) · [PDF 使用说明](output/pdf/user-guide.pdf)
+- [0.3.1 版本说明](docs/releases/v0.3.1.md) · [版本记录](CHANGELOG.md)
+- [科研工作台设计参考](docs/workbench-design-references.md)
 - [构型图设计参考](docs/diagram-design-references.md)
-- [完整 d=3 演示项目（模拟数据）](examples/surface_d3_complete.qchip)
-- [演示构型图](examples/surface_d3_complete_topology.png)
-- [演示比特频率图](examples/surface_d3_complete_qubit_f01.png)
-- [完整界面预览](examples/surface_d3_complete_preview.png)
-- [纵向数据表预览](examples/surface_d3_complete_table_vertical.png)
-- [深色模式预览](examples/surface_d3_complete_dark_preview.png)
-- [中文使用说明 PDF](output/pdf/user-guide.pdf)
-- [版本记录](CHANGELOG.md)
-- [GitHub 发布说明](docs/github-publishing.md)
-- [第三方组件说明](THIRD_PARTY_NOTICES.md)
+- [`.qchip` 格式规范 v3](docs/qchip-format-v3.md) · [旧 v2 格式规范](docs/qchip-format-v2.md)
+- [完整 d=3 模拟演示项目](examples/surface_d3_complete.qchip)
+- [构型图](examples/surface_d3_complete_topology.png) · [比特频率图](examples/surface_d3_complete_qubit_f01.png)
+- [明色界面](examples/surface_d3_complete_preview.png) · [纵向数据表](examples/surface_d3_complete_table_vertical.png) · [深色界面](examples/surface_d3_complete_dark_preview.png)
+- [GitHub 发布说明](docs/github-publishing.md) · [第三方组件说明](THIRD_PARTY_NOTICES.md)
 
-`examples/surface_d3_complete.qchip` 内的所有参数和接线都是模拟值。通过“视图 > 深色模式”切换界面，导出图片也沿用当前配色。
+演示项目内所有参数、工作点和接线都是模拟值。顶部主题按钮和“视图 > 深色模式”均可切换配色；图片导出沿用当前主题。
 
 ## 构建 Windows 发布版
-
-在 Windows 上运行：
 
 ```powershell
 python -m pip install -e ".[build]"
 powershell -File scripts/build_windows_release.ps1
 ```
 
-仓库附带生成好的 PDF 使用说明。如需修改后重新生成，安装 `.[docs]`，再运行 `python scripts/build_user_guide_pdf.py`；此脚本需要 Windows 系统中的中文字体。成功打包后仅保留最新发布版本。
+发布版固定启动入口为 `output/release/QubitSequencer/QubitSequencer.exe`；最终压缩包使用 `QubitSequencer-<版本>-win64.zip` 命名。`output/release/LATEST.txt` 记录已成功构建的版本、时间和文件路径。新版本成功打包后会替换旧发布目录，请将实际项目另存到该目录之外。
 
-发布版固定启动入口为 `output/release/QubitSequencer/QubitSequencer.exe`，当前压缩包为 `output/release/QubitSequencer-0.2.1-win64.zip`。`output/release/LATEST.txt` 记录版本、构建时间和对应文件路径。新版本打包成功后会替换旧发布版，请将实际编辑的 `.qchip` 项目另存到发布目录之外。
+仓库附带中文 PDF。修改文档后可安装 `.[docs]` 并运行 `python scripts/build_user_guide_pdf.py`；此脚本需要 Windows 中文字体。运行 `python scripts/capture_demo.py` 可更新真实界面截图；脚本使用示例文件副本和隔离设置，不修改源示例或个人窗口设置。
 
-第一版按单人编辑设计。一个 `.qchip` 文件可通过“文件 > 另存备份”复制；编辑时不要让多人同时写同一文件。标定实验记录与附件已有存储接口，完整的标定资料界面将随实际实验需求继续扩展。
-
-本地 `projects/`、构建缓存与发布目录不会提交到 Git；仓库只包含源码、文档和模拟示例。Windows 程序通过 GitHub Releases 分发。
+软件按单人编辑设计。需要传阅时使用“另存备份”，避免多人同时写同一个 `.qchip`。标定实验记录与附件已有存储接口，完整管理界面将按实际实验需求继续扩展。本地 `projects/`、构建缓存与发布目录不会提交到 Git。
 
 ## 许可
 
-本项目源码采用 [MIT 许可](LICENSE)。随 Windows 发布包分发的第三方组件保留各自许可，详见 [第三方组件说明](THIRD_PARTY_NOTICES.md) 和 `licenses/third-party/`。
+源码采用 [MIT 许可](LICENSE)。Windows 发布包中的第三方组件保留各自许可，见 [第三方组件说明](THIRD_PARTY_NOTICES.md) 和 `licenses/third-party/`。
