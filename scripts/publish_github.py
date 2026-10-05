@@ -67,7 +67,7 @@ class GitHub:
             headers["Content-Type"] = "application/json"
         request = urllib.request.Request(url, data=payload, headers=headers, method=method)
         try:
-            with urllib.request.urlopen(request, timeout=60) as response:
+            with urllib.request.urlopen(request, timeout=300 if file is not None else 60) as response:
                 return json.load(response)
         except urllib.error.HTTPError as exc:
             if missing_ok and exc.code in (404, 409):
@@ -139,6 +139,10 @@ def publish(client: GitHub, login: str, args: argparse.Namespace) -> None:
     if branch is not None and branch["object"]["sha"] != commit:
         raise RuntimeError("Existing main branch contains another commit; refusing to overwrite it")
     release = client.request(repository_path + f"/releases/tags/{tag}", missing_ok=True)
+    if release is None:
+        # The tag endpoint may omit drafts; resume an interrupted upload by ID.
+        release = next((item for item in client.request(repository_path + "/releases?per_page=100")
+                        if item["tag_name"] == tag), None)
     if release is not None and not release["draft"]:
         raise RuntimeError("This version is already published; refusing to replace it")
 
