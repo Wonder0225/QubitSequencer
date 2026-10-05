@@ -60,19 +60,23 @@ class GitHub:
         }
         payload = None
         if file is not None:
-            payload = file.read_bytes()
+            payload = file.open("rb")
             headers["Content-Type"] = "application/octet-stream"
+            headers["Content-Length"] = str(file.stat().st_size)
         elif data is not None:
             payload = json.dumps(data, ensure_ascii=False).encode("utf-8")
             headers["Content-Type"] = "application/json"
-        request = urllib.request.Request(url, data=payload, headers=headers, method=method)
         try:
+            request = urllib.request.Request(url, data=payload, headers=headers, method=method)
             with urllib.request.urlopen(request, timeout=300 if file is not None else 60) as response:
                 return json.load(response)
         except urllib.error.HTTPError as exc:
             if missing_ok and exc.code in (404, 409):
                 return None
             raise RuntimeError(f"GitHub returned HTTP {exc.code} for {method} {urllib.parse.urlparse(url).path}") from None
+        finally:
+            if file is not None and payload is not None:
+                payload.close()
 
 
 def digest(path: Path) -> str:
