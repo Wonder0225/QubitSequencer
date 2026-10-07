@@ -1,6 +1,8 @@
+param([switch]$SkipLocalPublish)
+
 $ErrorActionPreference = 'Stop'
 $projectRoot = (Resolve-Path (Join-Path $PSScriptRoot '..')).Path
-$releaseVersion = '0.3.1'
+$releaseVersion = '0.3.2'
 $buildStamp = Get-Date -Format 'yyyyMMdd-HHmmss'
 $distPath = Join-Path $projectRoot "output/release/builds/$releaseVersion-$buildStamp"
 Set-Location -LiteralPath $projectRoot
@@ -33,6 +35,8 @@ $release = Join-Path $distPath 'QubitSequencer'
 $examples = Join-Path $release 'examples'
 New-Item -ItemType Directory -Path $examples -Force | Out-Null
 Copy-Item -LiteralPath 'examples/surface_d3_complete.qchip' -Destination $examples -Force
+Copy-Item -LiteralPath 'examples/chip_design_release_demo.qchip' -Destination $examples -Force
+Copy-Item -LiteralPath 'examples/chip_design_demo.md' -Destination $examples -Force
 Copy-Item -LiteralPath 'examples/surface_d3_complete_preview.png' -Destination $examples -Force
 Copy-Item -LiteralPath 'examples/surface_d3_complete_topology.png' -Destination $examples -Force
 Copy-Item -LiteralPath 'examples/surface_d3_complete_dark_preview.png' -Destination $examples -Force
@@ -51,8 +55,12 @@ if (Test-Path -LiteralPath 'LICENSE') {
 
 $archive = Join-Path $projectRoot "output/release/QubitSequencer-$releaseVersion-win64-$buildStamp.zip"
 Compress-Archive -LiteralPath $release -DestinationPath $archive -Force
-& (Join-Path $PSScriptRoot 'publish_windows_release.ps1') `
+if (-not $SkipLocalPublish) {
+    & (Join-Path $PSScriptRoot 'publish_windows_release.ps1') `
     -SourceDirectory $release `
     -ArchivePath $archive `
     -Version $releaseVersion `
     -BuildStamp $buildStamp
+}
+Write-Host "Build directory: $release"
+Write-Host "Build archive: $archive"

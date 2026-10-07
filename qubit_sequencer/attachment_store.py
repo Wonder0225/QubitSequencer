@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 from dataclasses import dataclass
 from pathlib import Path
+from .undo import undoable
 
 
 ATTACHMENT_STATEMENTS = (
@@ -181,10 +182,12 @@ class AttachmentStore:
             ids.append(ident)
         return ids
 
+    @undoable("编辑标定附件")
     def commit_attachment_changes(self, record_id: str, changes):
         with self.db:
             return self._apply_attachment_changes(record_id, changes)
 
+    @undoable("恢复附件版本")
     def restore_attachment(self, attachment_id: str, version: int):
         row = self.read_attachment(attachment_id, version)
         owner = self.db.execute("SELECT record_id FROM record_attachments WHERE id=?", (attachment_id,)).fetchone()

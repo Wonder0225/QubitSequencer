@@ -9,6 +9,7 @@ from PySide6.QtWidgets import (
     QTableWidget, QToolButton, QVBoxLayout, QWidget,
 )
 from .editors import DeviceEditor
+from .design_ui import ChipDesignPanel
 
 
 class ProjectTitle(QLabel):
@@ -75,6 +76,12 @@ class WorkbenchLayout:
                 file_menu.addSeparator()
             if key in ("xlsx", "csv", "image", "images"):
                 self.export_menu.addAction(action)
+        edit_menu = self.menuBar().addMenu("编辑")
+        self.undo_action = self._action("撤回", self.undo_edit, "undo", "Ctrl+Z")
+        self.redo_action = self._action("恢复（重做）", self.redo_edit, "redo", "Ctrl+Y")
+        self.redo_action.setShortcuts(["Ctrl+Y", "Ctrl+Shift+Z"])
+        edit_menu.addAction(self.undo_action); edit_menu.addAction(self.redo_action)
+        self._update_undo_action()
         view_menu = self.menuBar().addMenu("视图")
         self.dark_action = QAction("深色模式", self)
         self.dark_action.setCheckable(True)
@@ -131,6 +138,15 @@ class WorkbenchLayout:
         root_layout.addLayout(body, 1)
         diagram_page = QWidget(); diagram_layout = QVBoxLayout(diagram_page)
         diagram_layout.setContentsMargins(12, 12, 12, 12); diagram_layout.setSpacing(8)
+        switch_row = QHBoxLayout()
+        self.design_button = self._tool_button(
+            "查看设计图", lambda: self._show_chip_design(self.chip_views.currentIndex() == 0), "chip")
+        self.design_button.setToolTip("在芯片逻辑构型和实际设计图之间切换")
+        switch_row.addWidget(self.design_button); switch_row.addStretch()
+        diagram_layout.addLayout(switch_row)
+        self.chip_views = QStackedWidget(); diagram_layout.addWidget(self.chip_views, 1)
+        topology_page = QWidget(); topology_layout = QVBoxLayout(topology_page)
+        topology_layout.setContentsMargins(0, 0, 0, 0); topology_layout.setSpacing(8)
         modes = QWidget(); modes_layout = QHBoxLayout(modes)
         modes_layout.setContentsMargins(0, 0, 0, 0); modes_layout.setSpacing(4)
         self.view_action = QAction("查看", self); self.view_action.setCheckable(True); self.view_action.setChecked(True)
@@ -158,7 +174,7 @@ class WorkbenchLayout:
         self.field_combo.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
         self.field_combo.setToolTip("选择构型或参数图层"); layer_layout.addWidget(self.field_combo, 1)
         fit = self._tool_button("适配芯片", self.fit_diagram, "fit")
-        self.canvas_toolbar = CanvasToolbar(modes, layer, fit); diagram_layout.addWidget(self.canvas_toolbar)
+        self.canvas_toolbar = CanvasToolbar(modes, layer, fit); topology_layout.addWidget(self.canvas_toolbar)
         self.diagram_splitter = QSplitter(); self.diagram_splitter.setChildrenCollapsible(False)
         self.view = ChipView(); self.diagram_splitter.addWidget(self.view)
         self.view.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
@@ -207,14 +223,21 @@ class WorkbenchLayout:
         self.diagram_splitter.setStretchFactor(0, 1); self.diagram_splitter.setStretchFactor(1, 0)
         width = max(260, min(440, int(self.settings.value("layout/inspectorWidth", 320))))
         self.diagram_splitter.setSizes([900, width]); self.diagram_splitter.splitterMoved.connect(self._remember_split)
-        diagram_layout.addWidget(self.diagram_splitter, 1)
+        topology_layout.addWidget(self.diagram_splitter, 1)
         bottom = QHBoxLayout()
         self.mode_hint = QLabel("查看模式 · 拖动平移，滚轮缩放"); self.mode_hint.setProperty("role", "muted")
         bottom.addWidget(self.mode_hint, 1)
         self.inspector_toggle = self._tool_button("详情", lambda: self.set_inspector_visible(self.inspector_container.isHidden()),
                                                  "chevron", "ghost")
         self.inspector_toggle.setCheckable(True); bottom.addWidget(self.inspector_toggle)
-        diagram_layout.addLayout(bottom); self.tabs.addWidget(diagram_page)
+        topology_layout.addLayout(bottom); self.chip_views.addWidget(topology_page)
+        self.design_panel = ChipDesignPanel(device_combo=TexComboBox())
+        self.design_panel.layout().setContentsMargins(0, 0, 0, 0)
+        self.design_panel.saved.connect(self._written)
+        self.design_panel.failed.connect(lambda message: self._error("设计图操作失败", message))
+        self.design_panel.device_clicked.connect(self.on_design_device_clicked)
+        self.chip_views.addWidget(self.design_panel)
+        self.tabs.addWidget(diagram_page)
         data_page = QWidget(); data_layout = QVBoxLayout(data_page)
         data_layout.setContentsMargins(16, 12, 16, 12); data_layout.setSpacing(12)
         heading = QLabel("参数数据表"); heading.setProperty("role", "heading"); data_layout.addWidget(heading)
@@ -283,8 +306,19 @@ class WorkbenchLayout:
         self.navigation.blockSignals(True); self.navigation.setCurrentRow(index); self.navigation.blockSignals(False)
         self.first_endpoint = None
         self.view_action.setChecked(True)
+        self.design_panel.edit_button.setChecked(False)
         if hasattr(self, "device_popup"):
             self.device_popup.close()
+        self._update_ui_state()
+
+    def _show_chip_design(self, visible):
+        self.first_endpoint = None
+        self.view_action.setChecked(True)
+        self.design_panel.edit_button.setChecked(False)
+        if hasattr(self, "device_popup"):
+            self.device_popup.close()
+        self.chip_views.setCurrentIndex(1 if visible else 0)
+        self.design_button.setText("返回构型图" if visible else "查看设计图")
         self._update_ui_state()
 
     def _remember_split(self, *_):
@@ -308,16 +342,19 @@ class WorkbenchLayout:
         if not hasattr(self, "wiring_buttons"):
             return
         opened = self.store is not None
+        showing_design = self.chip_views.currentIndex() == 1
+        self.design_button.setEnabled(opened)
         for key, action in self.file_actions.items():
             action.setEnabled(opened or key in ("new", "open"))
         self.export_button.setEnabled(opened); self.point_combo.setEnabled(opened)
         for action in (self.view_action, self.place_action, self.place_coupler_action, self.connect_action):
-            action.setEnabled(opened)
-        self.connection_mode.setEnabled(opened and self.connect_action.isChecked()); self.field_combo.setEnabled(opened)
+            action.setEnabled(opened and not showing_design)
+        self.connection_mode.setEnabled(opened and not showing_design and self.connect_action.isChecked())
+        self.field_combo.setEnabled(opened and not showing_design)
         selected = bool(opened and self.selected)
         dirty = selected and self.drafts.dirty(*self.selected)
         self.save_button.setEnabled(bool(dirty)); self.reset_button.setEnabled(bool(dirty)); self.custom_button.setEnabled(selected)
-        self.delete_action.setEnabled(selected and self.tabs.currentIndex() == 0)
+        self.delete_action.setEnabled(selected and self.tabs.currentIndex() == 0 and not showing_design)
         count = len(self.drafts.dirty_keys()) if opened else 0
         self.draft_status.setText(f"{count} 项未保存" if count else "")
         line_selected = bool(opened and self._chosen_line_id())

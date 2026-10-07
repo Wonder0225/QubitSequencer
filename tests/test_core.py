@@ -7,7 +7,7 @@ from pathlib import Path
 from openpyxl import load_workbook
 
 from qubit_sequencer.exports import build_tables, export_csv, export_xlsx
-from qubit_sequencer.storage import ChipStore
+from qubit_sequencer.storage import ChipStore, SCHEMA_VERSION
 from qubit_sequencer.templates import rotated_surface_code, square_grid
 
 
@@ -176,7 +176,7 @@ class StoreTests(unittest.TestCase):
         """)
         db.close()
         with ChipStore.open(self.path) as store:
-            self.assertEqual(store.db.execute("PRAGMA user_version").fetchone()[0], 3)
+            self.assertEqual(store.db.execute("PRAGMA user_version").fetchone()[0], SCHEMA_VERSION)
             self.assertEqual(len(store.links()), 2)
             by_qubit = {link["qubit_id"]: link["id"] for link in store.links()}
             self.assertEqual(store.current_values("idle")[(by_qubit["q1"], "link.g_qc")], 12)

@@ -23,6 +23,7 @@ from .diagram import ChipScene, cjk_font_family, export_diagram
 from .editors import DeviceEditor, DraftRegistry
 from .recent_files import RecentFiles, RecentFilesDialog
 from .attachment_ui import AttachmentPanel, AttachmentDialog, install_paste_shortcut
+from .design_ui import IMAGE_FILTER, read_design_file
 from .exports import build_tables, export_csv, export_xlsx
 from .storage import ChipStore
 from .templates import rotated_surface_code, square_grid
@@ -30,6 +31,8 @@ from .tex_labels import tex_to_html
 from .theme import UI_COLORS, palette, stylesheet
 from .ui_icons import icon
 from .workbench import WorkbenchLayout
+from .undo import EditHistory, undoable
+from .undo_ui import UndoController, install_form_undo
 
 
 TYPE_NAMES = {"fixed_transmon": "固定 Transmon", "tunable_transmon": "可调 Transmon",
@@ -129,6 +132,7 @@ def _dialog_buttons(layout, dialog, label="保存"):
         layout.addRow(buttons)
     else:
         layout.addWidget(buttons)
+    install_form_undo(dialog)
     return buttons
 
 
@@ -352,11 +356,27 @@ class NewChipDialog(QDialog):
         form.addRow("初始列数", self.columns)
         form.addRow("码距（奇数）", self.distance)
         form.addRow("模板连接", self.mode)
+        self.design_path = QLineEdit(); self.design_path.setReadOnly(True)
+        self.design_path.setPlaceholderText("可选：创建时导入芯片设计图")
+        design_row = QHBoxLayout()
+        design_row.addWidget(self.design_path)
+        choose_design = QPushButton("选择图片…")
+        choose_design.clicked.connect(self.choose_design)
+        design_row.addWidget(choose_design)
+        clear_design = QPushButton("清除")
+        clear_design.clicked.connect(self.design_path.clear)
+        design_row.addWidget(clear_design)
+        form.addRow("芯片设计图", design_row)
         self.error = QLabel(); self.error.setProperty("role", "danger"); self.error.setWordWrap(True)
         form.addRow(self.error)
         _dialog_buttons(form, self, "创建芯片")
         self.template.currentIndexChanged.connect(self._template_changed)
         self._template_changed()
+
+    def choose_design(self):
+        path, _ = QFileDialog.getOpenFileName(self, "选择芯片设计图", "", IMAGE_FILTER)
+        if path:
+            self.design_path.setText(path)
 
     def _template_changed(self, *_):
         surface = self.template.currentIndex() == 2
@@ -610,6 +630,10 @@ class MainWindow(QMainWindow, WorkbenchLayout):
         self.recent_files = RecentFiles(self.settings)
         self.drafts = DraftRegistry(lambda: self.store, self)
         self.drafts.changed.connect(self._update_ui_state)
+        self.undo_history = EditHistory(self._update_undo_action)
+        self.drafts.undo_history = self.undo_history
+        self.undo_history.add_state(self.drafts.undo_state, self.drafts.restore_undo_state)
+        self.undo_history.add_state(lambda: self.selected, lambda selected: setattr(self, "selected", selected))
         self.theme = "dark" if self.settings.value("theme", "light") == "dark" else "light"
         self.setWindowTitle("Qubit Sequencer 芯片登记")
         self.resize(1450, 900)
@@ -628,6 +652,7 @@ class MainWindow(QMainWindow, WorkbenchLayout):
         self.dark_action.blockSignals(False)
         self.set_theme(self.theme, persist=False)
         self.device_popup = DevicePopup(self)
+        self.undo_controller = UndoController(self)
         if path:
             self._open_path(path)
 
@@ -690,6 +715,40 @@ class MainWindow(QMainWindow, WorkbenchLayout):
     def _error(self, title: str, exc: Exception | str):
         QMessageBox.critical(self, title, str(exc))
 
+    def _update_undo_action(self):
+        if hasattr(self, "undo_action"):
+            label = self.undo_history.label
+            self.undo_action.setText(f"撤回{label}" if label else "撤回")
+            self.undo_action.setEnabled(bool(label))
+            label = self.undo_history.redo_label
+            self.redo_action.setText(f"恢复{label}" if label else "恢复（重做）")
+            self.redo_action.setEnabled(bool(label))
+
+    def undo_edit(self):
+        self._replay_edit(False)
+
+    def redo_edit(self):
+        self._replay_edit(True)
+
+    def _replay_edit(self, redo):
+        steps = self.undo_history.redo_steps if redo else self.undo_history.steps
+        if not steps:
+            return
+        try:
+            rows = steps[-1].rows
+            label = self.undo_history.redo() if redo else self.undo_history.undo()
+            self.first_endpoint = None
+            self._refresh_field_options()
+            if any(table == "chip_design" for table, _ in rows):
+                self.design_panel.reload_image()
+            self.refresh_content()
+            if rows:
+                self._written(f"{'恢复' if redo else '撤回'}{label}，结果")
+            else:
+                self.statusBar().showMessage(f"已{'恢复' if redo else '撤回'}{label}", 5000)
+        except Exception as exc:
+            self._error("恢复失败" if redo else "撤回失败", exc)
+
     def _leave_file(self):
         """Resolve all metadata drafts before replacing or closing a file."""
         if not self.store or not self.drafts.dirty_keys():
@@ -736,6 +795,8 @@ class MainWindow(QMainWindow, WorkbenchLayout):
             self.detail_editor.clear()
             self.selected = None
             self.drafts.clear()
+            self.undo_history.bind(incoming.db)
+            incoming.undo_history = self.undo_history
             if self.store:
                 self.store.close()
             self.store = incoming
@@ -786,6 +847,7 @@ class MainWindow(QMainWindow, WorkbenchLayout):
         store = None
         created = False
         try:
+            design = read_design_file(dialog.design_path.text()) if dialog.design_path.text() else None
             store = ChipStore.create(path, name, kind)
             created = True
             if kind == "surface":
@@ -795,6 +857,8 @@ class MainWindow(QMainWindow, WorkbenchLayout):
             else:
                 store.set_meta("grid_rows", str(dialog.rows.value()))
                 store.set_meta("grid_columns", str(dialog.columns.value()))
+            if design:
+                store.set_chip_design(*design)
             store.close()
             self._open_path(path)
         except Exception as exc:
@@ -870,6 +934,7 @@ class MainWindow(QMainWindow, WorkbenchLayout):
         self.refresh_history()
         self.refresh_wiring()
         self.refresh_detail()
+        self.design_panel.refresh(self.store)
         if hasattr(self, "device_popup") and self.device_popup.isVisible():
             self.device_popup.reload()
         self._update_ui_state()
@@ -882,6 +947,11 @@ class MainWindow(QMainWindow, WorkbenchLayout):
         if hasattr(self, "device_popup") and self.device_popup.isVisible():
             self.device_popup.reload()
         self._update_ui_state()
+
+    def on_design_device_clicked(self, ident: str, anchor: QPoint):
+        self.selected = ("device", ident)
+        self.refresh_detail()
+        self.device_popup.show_device(ident, anchor)
 
     def refresh_scene(self, *_):
         if not self.store:
@@ -949,6 +1019,7 @@ class MainWindow(QMainWindow, WorkbenchLayout):
         if kind == "device" and anchor is not None:
             QTimer.singleShot(0, lambda: self.device_popup.show_device(ident, anchor))
 
+    @undoable("放置器件")
     def on_blank_clicked(self, x: float, y: float):
         if not (self.place_action.isChecked() or self.place_coupler_action.isChecked()) or not self.store:
             return
@@ -981,6 +1052,7 @@ class MainWindow(QMainWindow, WorkbenchLayout):
         except Exception as exc:
             self._error("放置失败", exc)
 
+    @undoable("建立器件连接")
     def _connect(self, first: str, second: str):
         if not self.store:
             return
@@ -1131,8 +1203,10 @@ class MainWindow(QMainWindow, WorkbenchLayout):
         except Exception as exc:
             self._error("新增字段失败", exc)
 
+    @undoable("删除所选对象")
     def delete_selected(self):
-        if not self.store or not self.selected or self.tabs.currentIndex() != 0:
+        if (not self.store or not self.selected or self.tabs.currentIndex() != 0
+                or self.chip_views.currentIndex() != 0):
             return
         name = self.delete_action.text().removeprefix("删除 ")
         if QMessageBox.question(self, "确认删除", f"删除 {name} 及其关联记录？") != QMessageBox.StandardButton.Yes:
@@ -1287,6 +1361,7 @@ class MainWindow(QMainWindow, WorkbenchLayout):
             headers, rows = build_tables(self.store)["接线"]
             _table_fill(self.wiring_table, headers, rows)
 
+    @undoable("添加制冷机线路")
     def add_line(self):
         if not self.store:
             return
@@ -1309,6 +1384,7 @@ class MainWindow(QMainWindow, WorkbenchLayout):
         row = self.wiring_table.currentRow()
         return self.wiring_table.item(row, 0).text() if row >= 0 and self.wiring_table.item(row, 0) else None
 
+    @undoable("修改制冷机线路")
     def edit_line(self):
         if not self.store or not (line_id := self._chosen_line_id()):
             return
@@ -1466,6 +1542,9 @@ class MainWindow(QMainWindow, WorkbenchLayout):
         self.detail_editor.clear()
         self.selected = None
         self.drafts.clear()
+        self.undo_history.detach()
+        self.undo_history.clear()
+        self.undo_controller.dispose()
         if self.store:
             self.store.close()
             self.store = None

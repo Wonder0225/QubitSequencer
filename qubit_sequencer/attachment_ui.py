@@ -5,6 +5,7 @@ from __future__ import annotations
 import html
 import mimetypes
 import tempfile
+from copy import deepcopy
 from dataclasses import dataclass, replace
 from pathlib import Path
 
@@ -20,6 +21,8 @@ from PySide6.QtWidgets import (
 from .attachment_store import AttachmentChange, AttachmentInput, safe_file_name
 from .storage import beijing_now, display_timestamp, new_id
 from .tex_labels import tex_to_html
+from .undo import EditHistory, undoable
+from .undo_ui import install_form_undo
 
 TEXT_SUFFIXES = {
     ".txt", ".md", ".rst", ".log", ".csv", ".tsv", ".json", ".yaml", ".yml",
@@ -216,6 +219,8 @@ class AttachmentPanel(QWidget):
 
     def __init__(self, store=None, record_id=None, parent=None):
         super().__init__(parent)
+        self._is_attachment_panel = True
+        self.undo_history = EditHistory()
         self.store, self.record_id = store, record_id
         self.drafts = []
         self._loading = False
@@ -292,6 +297,22 @@ class AttachmentPanel(QWidget):
         QApplication.instance().aboutToQuit.connect(self.stop_readers)
         self.clipboard_changed()
         self.reload()
+        self.undo_history.add_state(self.undo_state, self.restore_undo_state)
+
+    def undo_state(self):
+        current = self.current()
+        selected = next((i for i, draft in enumerate(self.drafts) if draft is current), -1)
+        return deepcopy(self.drafts), selected
+
+    def restore_undo_state(self, state):
+        self.drafts = deepcopy(state[0])
+        self.refresh_list()
+        for index in range(self.files.count()):
+            draft = self.files.item(index).data(Qt.ItemDataRole.UserRole)
+            if 0 <= state[1] < len(self.drafts) and draft is self.drafts[state[1]]:
+                self.files.setCurrentRow(index)
+                break
+        self.changed.emit()
 
     @property
     def busy(self):
@@ -307,7 +328,11 @@ class AttachmentPanel(QWidget):
     def is_dirty(self):
         return any(draft.dirty() for draft in self.drafts)
 
-    def reload(self):
+    def reload(self, clear_history=True):
+        current = self.current()
+        selected_id = current.id if current else None
+        if clear_history:
+            self.undo_history.clear()
         self.import_errors.clear()
         self.clear_errors_button.setVisible(False)
         self.status.clear()
@@ -316,6 +341,11 @@ class AttachmentPanel(QWidget):
             for row in self.store.parameter_attachments(self.record_id, True)
         ] if self.store else []
         self.refresh_list()
+        if selected_id:
+            for index in range(self.files.count()):
+                if self.files.item(index).data(Qt.ItemDataRole.UserRole).id == selected_id:
+                    self.files.setCurrentRow(index)
+                    break
         self.changed.emit()
 
     def refresh_list(self, *_):
@@ -425,6 +455,7 @@ class AttachmentPanel(QWidget):
         self.restore_button.setEnabled(bool(enabled and self.selected_revision is not None))
         self.text.setReadOnly(not editable)
 
+    @undoable("编辑附件名称或说明", merge=lambda self, *_: (id(self), "metadata", id(self.current()), QApplication.focusWidget()))
     def metadata_changed(self, *_):
         if self._rendering:
             return
@@ -433,6 +464,7 @@ class AttachmentPanel(QWidget):
             draft.payload = replace(self.ensure_loaded(draft), file_name=self.name.text(), notes=self.notes.text())
             self.mark_changed()
 
+    @undoable("编辑附件文本", merge=lambda self: (id(self), "text", id(self.current())))
     def text_changed(self):
         if self._rendering:
             return
@@ -475,6 +507,7 @@ class AttachmentPanel(QWidget):
         finally:
             self._rendering = False; self.update_buttons()
 
+    @undoable("恢复附件历史版本")
     def restore_version(self):
         draft = self.current()
         if draft and self.selected_revision is not None:
@@ -488,6 +521,7 @@ class AttachmentPanel(QWidget):
             except Exception as exc:
                 self.status.setText(f"恢复失败：{exc}")
 
+    @undoable("移除或恢复附件")
     def toggle_removed(self):
         draft = self.current()
         if draft:
@@ -496,6 +530,7 @@ class AttachmentPanel(QWidget):
                 self.drafts.remove(draft)
             self.refresh_list(); self.changed.emit()
 
+    @undoable("添加附件")
     def add_payload(self, payload):
         draft = AttachmentDraft(None, {}, base=payload, payload=payload)
         self.drafts.append(draft)
@@ -555,6 +590,7 @@ class AttachmentPanel(QWidget):
         self.status.setText("正在读取附件，请稍候…")
         thread.start(); self.busy_changed.emit(True); self.update_buttons()
 
+    @undoable("导入或替换附件")
     def import_result(self, result):
         path, payload, error = result
         if error:
@@ -680,6 +716,7 @@ class AttachmentDialog(QDialog):
 
     def __init__(self, store, record_id, parent=None):
         super().__init__(parent)
+        self._is_attachment_dialog = True
         self.store, self.record_id = store, record_id
         self.setWindowTitle("参数记录与标定附件")
         self.resize(980, 670); self.setMinimumSize(700, 450)
@@ -719,6 +756,7 @@ class AttachmentDialog(QDialog):
         self.close_button.clicked.connect(self.close)
         self.panel.changed.connect(self.update_state); self.panel.busy_changed.connect(self.update_state)
         self._paste_shortcut = install_paste_shortcut(self, self.panel)
+        install_form_undo(self)
         self.update_state()
 
     def update_state(self, *_):
@@ -731,7 +769,10 @@ class AttachmentDialog(QDialog):
         try:
             changes = self.panel.changes()
             if changes:
-                self.store.commit_attachment_changes(self.record_id, changes)
+                changed_drafts = [draft for draft in self.panel.drafts if draft.dirty()]
+                ids = self.store.commit_attachment_changes(self.record_id, changes)
+                for draft, ident in zip(changed_drafts, ids):
+                    draft.id = ident
                 self.panel.reload(); self.saved.emit()
             self.error.clear(); self.panel.status.setText("附件更改已写入芯片文件。")
             return True
@@ -740,7 +781,8 @@ class AttachmentDialog(QDialog):
             return False
 
     def reset_changes(self):
-        self.panel.reload(); self.error.clear()
+        with self.panel.undo_history.action("取消附件更改"):
+            self.panel.reload(clear_history=False); self.error.clear()
 
     def reject(self):
         if self.panel.busy:

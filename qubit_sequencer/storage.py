@@ -14,8 +14,10 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from uuid import uuid4
 from .attachment_store import AttachmentStore, AttachmentInput, AttachmentChange, ATTACHMENT_SCHEMA
+from .design_store import DesignStore, DESIGN_SCHEMA
+from .undo import undoable
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 FORMAT_NAME = "qchip"
 BEIJING = timezone(timedelta(hours=8), "UTC+08:00")
 
@@ -173,12 +175,14 @@ CREATE TABLE attachments (
 
 
 SCHEMA += ATTACHMENT_SCHEMA
+SCHEMA += DESIGN_SCHEMA
 
 
-class ChipStore(AttachmentStore):
+class ChipStore(AttachmentStore, DesignStore):
     def __init__(self, path: str | Path, connection: sqlite3.Connection):
         self.path = Path(path)
         self.db = connection
+        self.undo_history = None
         self.db.row_factory = sqlite3.Row
         self.db.execute("PRAGMA foreign_keys=ON")
 
@@ -242,15 +246,18 @@ class ChipStore(AttachmentStore):
     def meta(self) -> dict[str, str]:
         return {r["key"]: r["value"] for r in self.db.execute("SELECT * FROM meta")}
 
+    @undoable("修改芯片名称")
     def set_name(self, name: str) -> None:
         with self.db:
             self.db.execute("UPDATE meta SET value=? WHERE key='chip_name'", (name.strip(),))
 
+    @undoable("修改芯片信息")
     def set_meta(self, key: str, value: str) -> None:
         with self.db:
             self.db.execute("INSERT INTO meta(key,value) VALUES (?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
                             (key, value))
 
+    @undoable("添加器件")
     def add_device(self, kind: str, subtype: str, label: str, x: float, y: float,
                    role: str = "", notes: str = "") -> str:
         if kind not in ("qubit", "coupler"):
@@ -271,6 +278,7 @@ class ChipStore(AttachmentStore):
                             (ident, kind, subtype, label.strip(), role, x, y, 0, 0, notes, beijing_now()))
         return ident
 
+    @undoable("修改器件")
     def update_device(self, ident: str, **changes: object) -> None:
         allowed = {"label", "subtype", "role", "x", "y", "dx", "dy", "notes"}
         if not changes or set(changes) - allowed:
@@ -308,10 +316,12 @@ class ChipStore(AttachmentStore):
             return self.db.execute("SELECT * FROM devices WHERE kind=? ORDER BY label", (kind,)).fetchall()
         return self.db.execute("SELECT * FROM devices ORDER BY kind,label").fetchall()
 
+    @undoable("删除器件")
     def delete_device(self, ident: str) -> None:
         with self.db:
             self.db.execute("DELETE FROM devices WHERE id=?", (ident,))
 
+    @undoable("添加耦合关系")
     def add_coupling(self, q1: str, q2: str, mode: str = "direct",
                      coupler_id: str | None = None, notes: str = "") -> str:
         if self.device(q1)["kind"] != "qubit" or self.device(q2)["kind"] != "qubit" or q1 == q2:
@@ -351,6 +361,7 @@ class ChipStore(AttachmentStore):
                         (ident, qubit_id, coupler_id, "", beijing_now()))
         return ident
 
+    @undoable("添加器件连接")
     def add_link(self, qubit_id: str, coupler_id: str, notes: str = "") -> str:
         if self.device(qubit_id)["kind"] != "qubit" or self.device(coupler_id)["kind"] != "coupler":
             raise ValueError("link must connect a qubit and a coupler")
@@ -386,11 +397,13 @@ class ChipStore(AttachmentStore):
         return self.db.execute("SELECT * FROM links WHERE coupler_id=? ORDER BY created_at,id",
                                (coupler_id,)).fetchall()
 
+    @undoable("修改连接备注")
     def update_link_notes(self, ident: str, notes: str) -> None:
         self.link(ident)
         with self.db:
             self.db.execute("UPDATE links SET notes=? WHERE id=?", (notes, ident))
 
+    @undoable("删除器件连接")
     def delete_link(self, ident: str) -> None:
         link = self.link(ident)
         with self.db:
@@ -407,6 +420,7 @@ class ChipStore(AttachmentStore):
     def couplings(self) -> list[sqlite3.Row]:
         return self.db.execute("SELECT * FROM couplings ORDER BY created_at,id").fetchall()
 
+    @undoable("删除耦合关系")
     def delete_coupling(self, ident: str) -> None:
         coupling = self.coupling(ident)
         with self.db:
@@ -415,11 +429,13 @@ class ChipStore(AttachmentStore):
                 self.db.execute("DELETE FROM links WHERE coupler_id=? AND qubit_id IN (?,?)",
                                 (coupling["coupler_id"], coupling["qubit_a"], coupling["qubit_b"]))
 
+    @undoable("修改耦合备注")
     def update_coupling_notes(self, ident: str, notes: str) -> None:
         self.coupling(ident)
         with self.db:
             self.db.execute("UPDATE couplings SET notes=? WHERE id=?", (notes, ident))
 
+    @undoable("添加制冷机线路")
     def add_line(self, line_type: str, cryostat: str = "", port: str = "",
                  channel: str = "", notes: str = "", devices: list[str] | None = None) -> str:
         if not line_type.strip():
@@ -441,6 +457,7 @@ class ChipStore(AttachmentStore):
             raise KeyError(line_id)
         return row
 
+    @undoable("修改制冷机线路")
     def update_line(self, line_id: str, line_type: str, cryostat: str = "", port: str = "",
                     channel: str = "", notes: str = "") -> None:
         self.line(line_id)
@@ -456,19 +473,23 @@ class ChipStore(AttachmentStore):
         return [r[0] for r in self.db.execute(
             "SELECT device_id FROM wiring_assignments WHERE line_id=?", (line_id,))]
 
+    @undoable("关联线路器件")
     def assign_line(self, line_id: str, device_id: str) -> None:
         with self.db:
             self.db.execute("INSERT OR IGNORE INTO wiring_assignments VALUES (?,?)", (line_id, device_id))
 
+    @undoable("解除线路关联")
     def unassign_line(self, line_id: str, device_id: str) -> None:
         with self.db:
             self.db.execute("DELETE FROM wiring_assignments WHERE line_id=? AND device_id=?",
                             (line_id, device_id))
 
+    @undoable("删除制冷机线路")
     def delete_line(self, line_id: str) -> None:
         with self.db:
             self.db.execute("DELETE FROM wiring_lines WHERE id=?", (line_id,))
 
+    @undoable("添加自定义参数")
     def add_definition(self, key: str, label: str, scope: str, value_type: str = "number",
                        unit: str = "", category: str = "custom") -> None:
         if scope not in ("qubit", "coupler", "coupling", "link") or value_type not in ("number", "text"):
@@ -495,6 +516,7 @@ class ChipStore(AttachmentStore):
             raise KeyError(key)
         return row
 
+    @undoable("登记参数")
     def set_parameter(self, owner_id: str, key: str, value: float | str | None,
                       point: str = "default", bias_value: float | None = None,
                       bias_unit: str = "", observed_at: str | None = None,
@@ -572,6 +594,7 @@ class ChipStore(AttachmentStore):
             )
         return values
 
+    @undoable("添加标定记录")
     def add_calibration(self, owner_id: str, experiment_type: str, fit_result: dict,
                         point: str = "default", notes: str = "") -> str:
         device = self.db.execute("SELECT 1 FROM devices WHERE id=?", (owner_id,)).fetchone()
@@ -585,6 +608,7 @@ class ChipStore(AttachmentStore):
                              experiment_type, beijing_now(), point, json.dumps(fit_result), notes))
         return ident
 
+    @undoable("添加标定附件")
     def add_attachment(self, calibration_id: str, file_name: str,
                        mime_type: str, data: bytes) -> str:
         ident = new_id()

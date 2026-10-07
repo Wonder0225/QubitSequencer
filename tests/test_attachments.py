@@ -117,6 +117,8 @@ def test_v2_migration_preserves_legacy_and_backup(store):
     legacy = store.add_attachment(calibration, "old.png", "image/png", b"original")
     path = store.path
     with store.db:
+        store.db.execute("DROP TABLE design_markers")
+        store.db.execute("DROP TABLE chip_design")
         store.db.execute("DROP TABLE attachment_versions")
         store.db.execute("DROP TABLE record_attachments")
         store.db.execute("DROP TABLE attachment_blobs")

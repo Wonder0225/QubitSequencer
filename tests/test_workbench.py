@@ -445,6 +445,14 @@ class WorkbenchTests(unittest.TestCase):
                 self.assertEqual(window.store.device(self.gamma)["label"], "Q_gamma")
                 confirm.assert_not_called()
         window.tabs.setCurrentIndex(0)
+        window.design_button.click()
+        self.process_events()
+        self.assertFalse(window.delete_action.isEnabled())
+        with patch.object(QMessageBox, "question") as confirm:
+            window.delete_selected()
+            self.assertEqual(window.store.device(self.gamma)["label"], "Q_gamma")
+            confirm.assert_not_called()
+        window.design_button.click()
         self.process_events()
         window.view.setFocus()
         with patch.object(QMessageBox, "question", return_value=QMessageBox.StandardButton.Yes) as confirm:

@@ -103,7 +103,16 @@ def _upgrade_2_to_3(db: sqlite3.Connection) -> None:
         db.execute("PRAGMA user_version=3")
 
 
-MIGRATIONS = {1: _upgrade_1_to_2, 2: _upgrade_2_to_3}
+def _upgrade_3_to_4(db: sqlite3.Connection) -> None:
+    from .design_store import DESIGN_STATEMENTS
+    with db:
+        db.execute("BEGIN IMMEDIATE")
+        for statement in DESIGN_STATEMENTS:
+            db.execute(statement)
+        db.execute("PRAGMA user_version=4")
+
+
+MIGRATIONS = {1: _upgrade_1_to_2, 2: _upgrade_2_to_3, 3: _upgrade_3_to_4}
 
 
 def migrate(path: str | Path) -> Path | None:

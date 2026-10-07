@@ -32,6 +32,7 @@ _SHAPES = {
     "close": '<path d="m5 5 10 10 M15 5 5 15"/>',
     "save": '<path d="M3 2.5h12l2 2v13H3z M6 2.5V7h7V2.5 M6 17.5V11h8v6.5"/>',
     "undo": '<path d="M3 8h8a5 5 0 0 1 0 10 M7 4 3 8l4 4"/>',
+    "redo": '<path d="M17 8H9a5 5 0 0 0 0 10 M13 4l4 4-4 4"/>',
     "help": '<circle cx="10" cy="10" r="7.5"/><path d="M7.5 7.5a2.5 2.5 0 1 1 4 2c-1 .6-1.5 1-1.5 2 M10 14.5v.1"/>',
 }
 

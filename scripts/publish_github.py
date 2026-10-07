@@ -101,6 +101,7 @@ def publish(client: GitHub, login: str, args: argparse.Namespace) -> None:
         if ".qchip" in name and name not in {
             "examples/square_lattice.qchip", "examples/surface_d3.qchip",
             "examples/surface_d3_complete.qchip",
+            "examples/chip_design_release_demo.qchip",
         }:
             raise RuntimeError(f"Non-demo chip data is tracked: {name}")
 

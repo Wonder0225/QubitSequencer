@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import math
+from copy import deepcopy
 from collections.abc import Callable
 from contextlib import contextmanager
 
@@ -13,6 +14,7 @@ from PySide6.QtWidgets import (
 )
 
 from .storage import ChipStore
+from .undo import undoable
 
 
 DEVICE_FIELDS = ("label", "subtype", "role", "x", "y", "notes")
@@ -55,6 +57,17 @@ class DraftRegistry(QObject):
         super().__init__(parent)
         self._store_getter = store_getter
         self._drafts: dict[tuple[str, str], dict] = {}
+        self.undo_history = None
+
+    def undo_state(self):
+        return deepcopy({key: state for key, state in self._drafts.items()
+                         if state["values"] != state["snapshot"] or state["error"]})
+
+    def restore_undo_state(self, snapshot):
+        keys = set(self._drafts) | set(snapshot)
+        self._drafts = deepcopy(snapshot)
+        for key in keys:
+            self.changed.emit(*key)
 
     def _store(self) -> ChipStore:
         store = self._store_getter()
@@ -85,6 +98,7 @@ class DraftRegistry(QObject):
     def values(self, kind: str, ident: str) -> dict:
         return self.ensure(kind, ident)["values"].copy()
 
+    @undoable("编辑器件信息", merge=True)
     def update(self, kind: str, ident: str, field: str, value: object) -> None:
         key = _key(kind, ident)
         state = self.ensure(*key)
@@ -106,6 +120,7 @@ class DraftRegistry(QObject):
         state = self._drafts.get(_key(kind, ident))
         return state["error"] if state else ""
 
+    @undoable("保存器件更改")
     def save(self, kind: str, ident: str) -> None:
         key = _key(kind, ident)
         try:
@@ -139,6 +154,7 @@ class DraftRegistry(QObject):
         state.update(snapshot=saved.copy(), values=saved.copy(), scope=scope, error="")
         self.changed.emit(*key)
 
+    @undoable("取消器件更改")
     def reset(self, kind: str, ident: str) -> None:
         key = _key(kind, ident)
         scope, saved = self._read(*key)

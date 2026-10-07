@@ -17,6 +17,7 @@ projects/
 !examples/square_lattice.qchip
 !examples/surface_d3.qchip
 !examples/surface_d3_complete.qchip
+!examples/chip_design_release_demo.qchip
 *.qchip.*
 # Windows bundles belong in GitHub Releases; retain the published PDF manual.
 output/*

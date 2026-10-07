@@ -1,15 +1,17 @@
 # Qubit Sequencer 芯片登记
 
-用于登记超导量子芯片的逻辑构型、比特/耦合器参数、耦合关系和制冷机接线的本机桌面程序。芯片项目保存为单个 `.qchip` 文件。当前源码版本为 **0.3.1**。
+用于登记超导量子芯片的逻辑构型、比特/耦合器参数、耦合关系和制冷机接线的本机桌面程序。芯片项目保存为单个 `.qchip` 文件。当前版本为 **0.3.2**。
 
-![0.3.1 深色科研工作台](docs/images/dark-mode.png)
+![科研工作台](docs/images/dark-mode.png)
 
 ## 功能
 
 - 顶部项目栏提供新建、打开、备份、全局工作点、导出与主题切换；左侧导航在芯片构型、参数数据表、制冷机接线和参数历史之间切换。
+- 芯片构型页提供“查看设计图”按钮，点击后显示设计图，使用“返回构型图”按钮回到逻辑结构图。设计图可在新建时或后续导入，支持任意角度旋转、缩放和平移。在图上标注比特/耦合器名称，拖动调整位置，点击查看参数；图片、角度及标注随项目保存，器件改名同步更新。
 - 可扩展正方格子、旋转表面码阵列和自定义构型，支持滚轮缩放、拖动平移及适配芯片。
 - 可调/固定 Transmon、直接电容耦合、固定/可调耦合器，以及独立的比特-耦合器物理连接。
 - 详情面板和器件弹窗共用编辑草稿；保存更改写入文件，取消更改恢复已保存值，关闭弹窗保留草稿。离开文件时可保存全部、放弃或取消。
+- 全部项目编辑支持 Ctrl+Z 撤回、Ctrl+Y / Ctrl+Shift+Z 恢复，也可使用“编辑”菜单。包括器件及连接增删、参数与附件、接线、设计图和共享草稿；对话框中的输入也支持撤回与恢复。当前会话保留最近 100 步，切换项目后清空。
 - 带单位的参数、自定义字段、工作点、历史记录及制冷机接线登记。参数和线路操作确认后立即写入文件。
 - 标签与参数表支持简单 TeX 上下标；数据表可横向或纵向显示，表头和单元格提示保留完整名称、单位及原值。
 - 文件菜单支持最近项目，Ctrl+R 打开可搜索列表；最多保留 20 项，跨启动保留。
@@ -40,16 +42,17 @@ python -m qubit_sequencer sample my_chip.qchip --template surface --mode coupler
 python -m qubit_sequencer validate my_chip.qchip
 ```
 
-当前源码及 Windows 0.3.1 发布版使用 v3 文件格式。旧 v1/v2 文件打开时会自动备份并迁移，也可执行 `python -m qubit_sequencer migrate my_chip.qchip`。迁移后的 v3 文件须使用当前版本打开。当前 PDF 随发布版保留，新增附件操作见 Markdown 使用说明；Windows 包也附带最新的 `user-guide.md` 和说明图片。
+0.3.2 源码及 Windows 发布版使用 v4 文件格式，包含芯片设计图。旧 v1/v2/v3 文件打开时会自动备份并迁移，也可执行 `python -m qubit_sequencer migrate my_chip.qchip`。原有 Windows 0.3.1 发布版使用 v3，不能打开升级后的项目；如需用原有发布版，使用迁移前的 `.pre-vN.qchip` 备份。本次已更新 Windows 发布包；PDF 保留此前版本，设计图和撤回／恢复操作见 Markdown 使用说明。
 
 ## 文档与示例
 
 - [中文使用说明](docs/user-guide.md) · [PDF 使用说明](output/pdf/user-guide.pdf)
-- [0.3.1 版本说明](docs/releases/v0.3.1.md) · [版本记录](CHANGELOG.md)
+- [0.3.2 版本说明](docs/releases/v0.3.2.md) · [版本记录](CHANGELOG.md)
 - [科研工作台设计参考](docs/workbench-design-references.md)
 - [构型图设计参考](docs/diagram-design-references.md)
-- [`.qchip` 格式规范 v3](docs/qchip-format-v3.md) · [旧 v2 格式规范](docs/qchip-format-v2.md)
+- [`.qchip` 格式规范 v4](docs/qchip-format-v4.md) · [v3 格式规范](docs/qchip-format-v3.md) · [旧 v2 格式规范](docs/qchip-format-v2.md)
 - [完整 d=3 模拟演示项目](examples/surface_d3_complete.qchip)
+- [芯片设计图测试示例](examples/chip_design_release_demo.qchip) · [测试操作说明](examples/chip_design_demo.md)
 - [构型图](examples/surface_d3_complete_topology.png) · [比特频率图](examples/surface_d3_complete_qubit_f01.png)
 - [明色界面](examples/surface_d3_complete_preview.png) · [纵向数据表](examples/surface_d3_complete_table_vertical.png) · [深色界面](examples/surface_d3_complete_dark_preview.png)
 - [GitHub 发布说明](docs/github-publishing.md) · [第三方组件说明](THIRD_PARTY_NOTICES.md)
