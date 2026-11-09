@@ -72,6 +72,8 @@ def test_v3_upgrade_preserves_parameters_and_original_backup(tmp_path):
         qubit = store.add_device("qubit", "fixed_transmon", "Q1", 0, 0)
         store.set_parameter(qubit, "qubit.f01", 5.2)
         with store.db:
+            store.db.execute("DROP TABLE readout_links")
+            store.db.execute("DROP TABLE wiring_details")
             store.db.execute("DROP TABLE design_markers")
             store.db.execute("DROP TABLE chip_design")
             store.db.execute("PRAGMA user_version=3")
@@ -216,3 +218,63 @@ def test_new_chip_can_import_layout_at_creation(app, window, tmp_path, layout_fi
     assert window.store.chip_design()["data"] == layout_file.read_bytes()
     assert not design_image(window.store.chip_design()["data"]).isNull()
     assert window.design_panel.view.image_item is not None
+
+
+def test_clipboard_import_replace_cancel_undo_redo_and_reopen(window):
+    panel = window.design_panel
+    image = QImage(200, 120, QImage.Format.Format_ARGB32)
+    image.fill(Qt.GlobalColor.transparent)
+    image.setPixelColor(20, 20, Qt.GlobalColor.cyan)
+    # Mock the clipboard provider without changing the user's clipboard.
+    with patch("qubit_sequencer.attachment_ui.QGuiApplication.clipboard") as clipboard:
+        clipboard.return_value.image.return_value = image
+        panel.clipboard_import_button.click()
+        old_data = window.store.chip_design()["data"]
+        decoded = design_image(old_data)
+        assert decoded.size() == image.size()
+        assert decoded.pixelColor(0, 0).alpha() == 0
+        assert decoded.pixelColor(20, 20) == image.pixelColor(20, 20)
+        assert window.store.chip_design()["file_name"].endswith(".png")
+        panel.edit_button.setChecked(True)
+        ident = panel.devices.currentData()
+        panel.place_marker(.3, .4); panel.angle.setValue(45)
+        count = len(window.undo_history.steps)
+        replacement = QImage(320, 180, QImage.Format.Format_RGB32)
+        replacement.fill(Qt.GlobalColor.red)
+        clipboard.return_value.image.return_value = replacement
+        with patch("qubit_sequencer.design_ui.QMessageBox.question", return_value=QMessageBox.StandardButton.No):
+            panel.clipboard_import_button.click()
+        assert window.store.chip_design()["data"] == old_data
+        assert panel.angle.value() == 45 and ident in panel.view.markers
+        assert len(window.undo_history.steps) == count
+        with patch("qubit_sequencer.design_ui.QMessageBox.question", return_value=QMessageBox.StandardButton.Yes):
+            panel.clipboard_import_button.click()
+    assert panel.angle.value() == 0 and panel.view.markers == {}
+    assert len(window.undo_history.steps) == count+1
+    window.undo_edit()
+    assert window.store.chip_design()["data"] == old_data
+    assert panel.angle.value() == 45 and ident in panel.view.markers
+    window.redo_edit()
+    assert panel.angle.value() == 0 and panel.view.markers == {}
+    assert window._open_path(str(window.store.path))
+    assert panel.view.image_item.pixmap().size() == replacement.size()
+    assert design_image(window.store.chip_design()["data"]).pixelColor(0, 0) == replacement.pixelColor(0, 0)
+
+
+def test_clipboard_without_image_preserves_existing_design(window, layout_file):
+    panel = window.design_panel
+    import_layout(panel, layout_file)
+    panel.edit_button.setChecked(True)
+    ident = panel.devices.currentData()
+    panel.place_marker(.2, .6); panel.angle.setValue(90)
+    old_data = window.store.chip_design()["data"]
+    count = len(window.undo_history.steps)
+    with patch("qubit_sequencer.attachment_ui.QGuiApplication.clipboard") as clipboard, \
+            patch.object(window, "_error") as error:
+        clipboard.return_value.image.return_value = QImage()
+        panel.clipboard_import_button.click()
+        error.assert_called_once()
+        assert "剪贴板中没有图片" in error.call_args.args[1]
+    assert window.store.chip_design()["data"] == old_data
+    assert panel.angle.value() == 90 and ident in panel.view.markers
+    assert len(window.undo_history.steps) == count

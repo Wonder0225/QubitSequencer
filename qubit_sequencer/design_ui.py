@@ -11,6 +11,8 @@ from PySide6.QtWidgets import (
 )
 
 from .tex_labels import tex_to_html
+from .device_types import DEVICE_NAMES, DEVICE_COLORS
+from .attachment_ui import clipboard_payload
 
 
 IMAGE_FILTER = "设计图 (*.png *.jpg *.jpeg *.bmp *.tif *.tiff *.webp);;所有文件 (*)"
@@ -37,6 +39,7 @@ class DesignMarker(QGraphicsObject):
     def __init__(self, row, image_item, editing):
         super().__init__(image_item)
         self.device_id = row["device_id"]
+        self.kind = row["kind"]
         self.setFlag(QGraphicsItem.GraphicsItemFlag.ItemIgnoresTransformations)
         self.setFlag(QGraphicsItem.GraphicsItemFlag.ItemIsSelectable)
         self.setZValue(1)
@@ -54,7 +57,7 @@ class DesignMarker(QGraphicsObject):
         self.document.setHtml(f'<span style="color:white">{tex_to_html(label)}</span>')
         size = self.document.size()
         self.badge = QRectF(9, -size.height() - 12, size.width() + 16, size.height() + 8)
-        self.setToolTip(label)
+        self.setToolTip(f"{DEVICE_NAMES[self.kind]} · {label}")
         self.update()
 
     def set_editing(self, editing):
@@ -67,10 +70,15 @@ class DesignMarker(QGraphicsObject):
 
     def paint(self, painter, option, widget=None):
         painter.setRenderHint(QPainter.RenderHint.Antialiasing)
-        color = QColor("#f59e0b" if self.isSelected() else "#2563eb")
+        color = QColor("#f59e0b" if self.isSelected() else DEVICE_COLORS[self.kind])
         painter.setPen(QPen(QColor("white"), 2))
         painter.setBrush(color)
-        painter.drawEllipse(QPointF(0, 0), 6, 6)
+        if self.kind == "readout":
+            painter.drawRoundedRect(QRectF(-6, -3, 12, 6), 2, 2)
+        elif self.kind == "filter":
+            painter.drawRoundedRect(QRectF(-6, -6, 12, 12), 2, 2)
+        else:
+            painter.drawEllipse(QPointF(0, 0), 6, 6)
         painter.drawLine(QPointF(4, -4), self.badge.bottomLeft())
         painter.drawRoundedRect(self.badge, 5, 5)
         painter.translate(self.badge.topLeft() + QPointF(8, 4))
@@ -102,6 +110,7 @@ class DesignView(QGraphicsView):
         self.image_item = None
         self.markers = {}
         self.editing = False
+        self.marker_opacity = 1.0
         self.fitted = True
         self.setRenderHints(QPainter.RenderHint.Antialiasing | QPainter.RenderHint.SmoothPixmapTransform)
         self.setDragMode(QGraphicsView.DragMode.ScrollHandDrag)
@@ -140,6 +149,12 @@ class DesignView(QGraphicsView):
                 item.setPos(row["x"] * rect.width(), row["y"] * rect.height())
             else:
                 self.markers[ident] = DesignMarker(row, self.image_item, self.editing)
+            self.markers[ident].setOpacity(self.marker_opacity)
+
+    def set_marker_opacity(self, opacity):
+        self.marker_opacity = opacity
+        for item in self.markers.values():
+            item.setOpacity(opacity)
 
     def set_editing(self, editing):
         self.editing = editing
@@ -194,12 +209,17 @@ class ChipDesignPanel(QWidget):
     def __init__(self, device_combo=None):
         super().__init__()
         self.store = None
+        self.readout_visible = True
         layout = QVBoxLayout(self)
         layout.setContentsMargins(12, 12, 12, 12)
         toolbar = QHBoxLayout()
         self.import_button = QPushButton("导入设计图")
         self.import_button.clicked.connect(self.import_image)
         toolbar.addWidget(self.import_button)
+        self.clipboard_import_button = QPushButton("从剪贴板导入")
+        self.clipboard_import_button.setToolTip("先复制图片或截图，再从剪贴板导入为芯片设计图")
+        self.clipboard_import_button.clicked.connect(self.import_clipboard_image)
+        toolbar.addWidget(self.clipboard_import_button)
         self.remove_image_button = QPushButton("移除设计图")
         self.remove_image_button.clicked.connect(self.remove_image)
         toolbar.addWidget(self.remove_image_button)
@@ -224,6 +244,16 @@ class ChipDesignPanel(QWidget):
         self.edit_button = QPushButton("编辑标注"); self.edit_button.setCheckable(True)
         self.edit_button.toggled.connect(self.set_editing)
         row.addWidget(self.edit_button)
+        self.translucent_button = QPushButton("半透明标注")
+        self.translucent_button.setCheckable(True)
+        self.translucent_button.setToolTip("以 50% 不透明度显示标注，便于查看下方版图")
+        row.addWidget(self.translucent_button)
+        self.device_kind = QComboBox()
+        self.device_kind.addItem("全部元件", None)
+        for kind, caption in DEVICE_NAMES.items():
+            self.device_kind.addItem(caption, kind)
+        self.device_kind.currentIndexChanged.connect(self.refresh_markers)
+        row.addWidget(self.device_kind)
         self.devices = device_combo if device_combo is not None else QComboBox()
         self.devices.setMinimumWidth(180)
         self.devices.currentIndexChanged.connect(self.update_controls)
@@ -233,6 +263,7 @@ class ChipDesignPanel(QWidget):
         row.addWidget(self.remove_marker_button)
         layout.addLayout(row)
         self.view = DesignView(); self.view.placed.connect(self.place_marker)
+        self.translucent_button.toggled.connect(lambda checked: self.view.set_marker_opacity(.5 if checked else 1.0))
         layout.addWidget(self.view, 1)
         self.hint = QLabel(); self.hint.setWordWrap(True); self.hint.setProperty("role", "muted")
         layout.addWidget(self.hint)
@@ -257,7 +288,7 @@ class ChipDesignPanel(QWidget):
         self.view.set_image(design_image(row["data"]) if row else None, row["rotation"] if row else 0)
         self.file_name = row["file_name"] if row else ""
 
-    def refresh_markers(self):
+    def refresh_markers(self, *_):
         chosen = self.devices.currentData()
         rows = self.store.design_markers() if self.store else []
         if self.view.image_item:
@@ -267,16 +298,22 @@ class ChipDesignPanel(QWidget):
                     item.activated.connect(self.activate_marker)
                     item.moved.connect(self.move_marker)
                     item.connected = True
+                item.setVisible(self.readout_visible or item.kind not in ("readout", "filter"))
         marked = {row["device_id"] for row in rows}
         self.devices.blockSignals(True)
         self.devices.clear()
+        devices = self.store.devices() if self.store else []
         if self.store:
-            for device in self.store.devices():
+            for device in devices:
+                if not self.readout_visible and device["kind"] in ("readout", "filter"):
+                    continue
+                if self.device_kind.currentData() and device["kind"] != self.device_kind.currentData():
+                    continue
                 status = "已标注" if device["id"] in marked else "未标注"
-                self.devices.addItem(f"{device['label']} · {status}", device["id"])
+                self.devices.addItem(f"{DEVICE_NAMES[device['kind']]} · {device['label']} · {status}", device["id"])
         self.devices.setCurrentIndex(max(0, self.devices.findData(chosen)))
         self.devices.blockSignals(False)
-        total = self.devices.count()
+        total = len(devices)
         self.summary.setText(f"{self.file_name} · 已标注 {len(rows)}/{total} 个器件 · 更改立即保存"
                              if self.view.image_item else "尚未导入芯片设计图；图片和标注将内嵌保存至 .qchip")
         self.update_controls()
@@ -284,11 +321,13 @@ class ChipDesignPanel(QWidget):
     def update_controls(self, *_):
         has_image = self.view.image_item is not None
         self.import_button.setEnabled(self.store is not None)
+        self.clipboard_import_button.setEnabled(self.store is not None)
         for button in (self.remove_image_button, self.rotate_left, self.rotate_right,
-                       self.angle, self.fit_button, self.edit_button):
+                       self.angle, self.fit_button, self.edit_button, self.translucent_button):
             button.setEnabled(has_image)
         editing = self.edit_button.isChecked()
         self.devices.setEnabled(has_image)
+        self.device_kind.setEnabled(has_image)
         chosen = self.devices.currentData()
         self.remove_marker_button.setEnabled(has_image and editing and chosen in self.view.markers)
         for ident, item in self.view.markers.items():
@@ -306,15 +345,27 @@ class ChipDesignPanel(QWidget):
             return
         try:
             name, data = read_design_file(path)
-            if self.view.image_item and QMessageBox.question(
-                    self, "替换设计图", "替换后将清除当前设计图的标注和旋转角度，是否继续？"
-            ) != QMessageBox.StandardButton.Yes:
-                return
-            self.store.set_chip_design(name, data)
-            self.reload_image(); self.refresh_markers()
-            self.saved.emit("芯片设计图")
+            self._replace_design(name, data)
         except Exception as exc:
             self.failed.emit(str(exc))
+
+    def import_clipboard_image(self):
+        try:
+            payload = clipboard_payload()
+            if payload is None:
+                raise ValueError("剪贴板中没有图片，请先复制图片或截图")
+            self._replace_design(payload.file_name, payload.data)
+        except Exception as exc:
+            self.failed.emit(str(exc))
+
+    def _replace_design(self, name, data):
+        if self.view.image_item and QMessageBox.question(
+                self, "替换设计图", "替换后将清除当前设计图的标注和旋转角度，是否继续？"
+        ) != QMessageBox.StandardButton.Yes:
+            return
+        self.store.set_chip_design(name, data)
+        self.reload_image(); self.refresh_markers()
+        self.saved.emit("芯片设计图")
 
     def remove_image(self):
         if QMessageBox.question(self, "移除设计图", "移除设计图及其全部标注？芯片逻辑构型将保留。"
@@ -363,6 +414,8 @@ class ChipDesignPanel(QWidget):
             self.failed.emit(str(exc))
 
     def activate_marker(self, ident, screen_pos):
+        if self.devices.findData(ident) < 0:
+            self.device_kind.setCurrentIndex(0)
         self.devices.setCurrentIndex(self.devices.findData(ident))
         if not self.edit_button.isChecked():
             self.device_clicked.emit(ident, screen_pos)

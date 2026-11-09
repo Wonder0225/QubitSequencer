@@ -73,10 +73,12 @@ class DiagramTests(unittest.TestCase):
             self.app.processEvents()
             self.assertLess(window.scene.sceneRect().left(), old_left)
             window.place_action.setChecked(True)
-            with patch.object(QInputDialog, "getText", side_effect=[("Q_A", True), ("Q_B", True)]), \
+            with patch.object(QInputDialog, "getText", side_effect=[("", False), ("Q_A", True), ("Q_B", True)]) as names, \
                  patch.object(QInputDialog, "getItem", return_value=("可调 Transmon", True)):
                 window.on_blank_clicked(0, 0)
+                window.on_blank_clicked(0, 0)
                 window.on_blank_clicked(8, 6)
+            self.assertEqual([call.kwargs["text"] for call in names.call_args_list], ["q_{1}", "q_{1}", "q_{2}"])
             qubits = window.store.devices("qubit")
             self.assertEqual({q["label"] for q in qubits}, {"Q_A", "Q_B"})
             self.assertIn((8, 6), {(q["x"], q["y"]) for q in qubits})
@@ -87,6 +89,7 @@ class DiagramTests(unittest.TestCase):
             window.on_scene_clicked("device", qubits[0]["id"])
             window.on_scene_clicked("device", qubits[1]["id"])
             self.assertEqual({c["mode"] for c in window.store.couplings()}, {"direct", "coupler"})
+            self.assertEqual([c["label"] for c in window.store.devices("coupler")], ["c_{AB}"])
             self.assertEqual(len(window.store.links()), 2)
             link = window.store.links()[0]
             window.on_scene_clicked("link", link["id"])
@@ -109,17 +112,23 @@ class DiagramTests(unittest.TestCase):
             with ChipStore.create(path, "手工耦合", "custom") as store:
                 a = store.add_device("qubit", "fixed_transmon", "A", 0, 0)
                 b = store.add_device("qubit", "fixed_transmon", "B", 1, 0)
-                c = store.add_device("coupler", "fixed_coupler", "C", .5, 0)
             window = MainWindow(str(path))
+            window.place_coupler_action.setChecked(True)
+            with patch.object(QInputDialog, "getText", side_effect=lambda *args, text: (text, True)), \
+                 patch.object(QInputDialog, "getItem", return_value=("固定耦合器", True)):
+                window.on_blank_clicked(.5, 0)
+            c = window.store.devices("coupler")[0]["id"]
             window.connect_action.setChecked(True)
             window.on_scene_clicked("device", a)
             window.on_scene_clicked("device", c)
             self.assertEqual(len(window.store.links()), 1)
             self.assertEqual(len(window.store.couplings()), 0)
+            self.assertEqual(window.store.device(c)["label"], "c_{1}")
             window.on_scene_clicked("device", c)
             window.on_scene_clicked("device", b)
             self.assertEqual(len(window.store.links()), 2)
             self.assertEqual(len(window.store.couplings()), 1)
+            self.assertEqual(window.store.device(c)["label"], "c_{AB}")
             window.store.set_parameter(window.store.links()[0]["id"], "link.g_qc", 35.0)
             window.refresh_content()
             window.connect_action.setChecked(False)

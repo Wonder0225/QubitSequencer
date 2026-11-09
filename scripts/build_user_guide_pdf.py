@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import html
 import re
+import tomllib
 from pathlib import Path
 
 from reportlab.lib import colors
@@ -24,6 +25,7 @@ from reportlab.platypus import (
 ROOT = Path(__file__).resolve().parents[1]
 SOURCE = ROOT / "docs" / "user-guide.md"
 OUTPUT = ROOT / "output" / "pdf" / "user-guide.pdf"
+VERSION = tomllib.loads((ROOT / "pyproject.toml").read_text(encoding="utf-8"))["project"]["version"]
 
 
 def register_fonts() -> None:
@@ -64,6 +66,9 @@ def build() -> Path:
         "Heading", parent=normal, fontSize=14.5, leading=23, spaceBefore=17,
         spaceAfter=8, textColor=colors.HexColor("#244B72"), keepWithNext=True,
     )
+    subheading = ParagraphStyle(
+        "Subheading", parent=heading, fontSize=11.5, leading=19, spaceBefore=12,
+    )
     bullet = ParagraphStyle(
         "Bullet", parent=normal, leftIndent=18, firstLineIndent=-12, spaceAfter=5,
     )
@@ -72,13 +77,38 @@ def build() -> Path:
         textColor=colors.HexColor("#60758B"), spaceAfter=10,
     )
     code_style = ParagraphStyle(
-        "Code", fontName="Courier", fontSize=8, leading=12,
+        "Code", fontName="GuideCJK", fontSize=8, leading=12,
         textColor=colors.HexColor("#21354D"), spaceAfter=0,
     )
     story = []
     paragraph_lines: list[str] = []
     code_lines: list[str] = []
+    table_lines: list[list[str]] = []
     in_code = False
+
+    def flush_table() -> None:
+        if not table_lines:
+            return
+        cell_style = ParagraphStyle("TableCell", parent=normal, fontSize=9, leading=15, spaceAfter=0)
+        header_style = ParagraphStyle("TableHeader", parent=cell_style, textColor=colors.white)
+        rows = [[Paragraph(inline_markup(cell), header_style if index == 0 else cell_style)
+                 for cell in row] for index, row in enumerate(table_lines)]
+        width = A4[0] - 96
+        columns = len(rows[0])
+        widths = [width*.28] + [width*.72/(columns-1)]*(columns-1) if columns > 1 else [width]
+        table = Table(rows, colWidths=widths, repeatRows=1, hAlign="LEFT")
+        table.setStyle(TableStyle([
+            ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#244B72")),
+            ("ROWBACKGROUNDS", (0, 1), (-1, -1), [colors.white, colors.HexColor("#F1F5F9")]),
+            ("GRID", (0, 0), (-1, -1), .5, colors.HexColor("#D5E0EB")),
+            ("VALIGN", (0, 0), (-1, -1), "TOP"),
+            ("LEFTPADDING", (0, 0), (-1, -1), 8),
+            ("RIGHTPADDING", (0, 0), (-1, -1), 8),
+            ("TOPPADDING", (0, 0), (-1, -1), 7),
+            ("BOTTOMPADDING", (0, 0), (-1, -1), 7),
+        ]))
+        story.extend([table, Spacer(1, 10)])
+        table_lines.clear()
 
     def flush_paragraph(keep_with_next: bool = False) -> None:
         if paragraph_lines:
@@ -113,6 +143,13 @@ def build() -> Path:
         if in_code:
             code_lines.append(raw)
             continue
+        if line.startswith("|"):
+            flush_paragraph(keep_with_next=True)
+            cells = [cell.strip() for cell in line.strip("|").split("|")]
+            if not all(re.fullmatch(r":?-{3,}:?", cell) for cell in cells):
+                table_lines.append(cells)
+            continue
+        flush_table()
         if not line:
             flush_paragraph()
             continue
@@ -143,13 +180,22 @@ def build() -> Path:
             flush_paragraph()
             story.append(Paragraph(inline_markup(line[3:]), heading))
             continue
+        if line.startswith("### "):
+            flush_paragraph()
+            story.append(Paragraph(inline_markup(line[4:]), subheading))
+            continue
         if line.startswith("- "):
             flush_paragraph()
             story.append(Paragraph("- " + inline_markup(line[2:]), bullet))
             continue
+        if re.match(r"\d+\. ", line):
+            flush_paragraph()
+            story.append(Paragraph(inline_markup(line), bullet))
+            continue
         paragraph_lines.append(line)
     flush_paragraph()
     flush_code()
+    flush_table()
 
     def page_furniture(canvas, doc):
         canvas.saveState()
@@ -157,7 +203,7 @@ def build() -> Path:
         canvas.line(48, A4[1] - 40, A4[0] - 48, A4[1] - 40)
         canvas.setFont("GuideCJK", 8)
         canvas.setFillColor(colors.HexColor("#627890"))
-        canvas.drawString(48, A4[1] - 31, "Qubit Sequencer · 0.3.1 用户手册")
+        canvas.drawString(48, A4[1] - 31, f"Qubit Sequencer · {VERSION} 用户手册")
         canvas.drawRightString(A4[0] - 48, 30, f"{doc.page}")
         canvas.restoreState()
 

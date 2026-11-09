@@ -5,7 +5,7 @@ from __future__ import annotations
 from .storage import ChipStore
 
 
-def _join(store: ChipStore, a: str, b: str, mode: str, label: str) -> None:
+def _join(store: ChipStore, a: str, b: str, mode: str) -> None:
     if mode == "none":
         return
     if mode == "direct":
@@ -15,7 +15,7 @@ def _join(store: ChipStore, a: str, b: str, mode: str, label: str) -> None:
         raise ValueError("mode must be none, direct or coupler")
     qa, qb = store.device(a), store.device(b)
     cx, cy = (qa["x"] + qb["x"]) / 2, (qa["y"] + qb["y"]) / 2
-    mediator = store.add_device("coupler", "tunable_coupler", label, cx, cy)
+    mediator = store.add_device("coupler", "tunable_coupler", None, cx, cy)
     store.add_coupling(a, b, "coupler", mediator)
 
 
@@ -32,14 +32,12 @@ def square_grid(store: ChipStore, rows: int, columns: int,
     qubits = {}
     for r in range(rows):
         for c in range(columns):
-            qubits[r, c] = store.add_device("qubit", subtype, f"Q_{r}_{c}", c, r)
-    n = 0
+            qubits[r, c] = store.add_device("qubit", subtype, None, c, r)
     for r in range(rows):
         for c in range(columns):
             for dr, dc in ((1, 0), (0, 1)):
                 if (r + dr, c + dc) in qubits:
-                    n += 1
-                    _join(store, qubits[r, c], qubits[r + dr, c + dc], mode, f"C_{n}")
+                    _join(store, qubits[r, c], qubits[r + dr, c + dc], mode)
 
 
 def rotated_surface_code(store: ChipStore, distance: int,
@@ -66,18 +64,13 @@ def rotated_surface_code(store: ChipStore, distance: int,
     for r in range(distance):
         for c in range(distance):
             x, y = location(r, c)
-            data[r, c] = store.add_device("qubit", subtype, f"D_{r}_{c}", x, y, "data")
-
-    check_index = 0
+            data[r, c] = store.add_device("qubit", subtype, None, x, y, "data")
 
     def check(r: float, c: float, role: str, neighbors: list[tuple[int, int]]) -> None:
-        nonlocal check_index
-        check_index += 1
         x, y = location(r, c)
-        ancilla = store.add_device("qubit", subtype,
-                                   f"{'X' if role == 'measure_x' else 'Z'}_{check_index}", x, y, role)
+        ancilla = store.add_device("qubit", subtype, None, x, y, role)
         for qr, qc in neighbors:
-            _join(store, ancilla, data[qr, qc], mode, f"C_{check_index}_{qr}_{qc}")
+            _join(store, ancilla, data[qr, qc], mode)
 
     for r in range(distance - 1):
         for c in range(distance - 1):

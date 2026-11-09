@@ -13,6 +13,7 @@ from unittest.mock import patch
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 from PySide6.QtCore import QPoint, QSettings, Qt
+from PySide6.QtGui import QContextMenuEvent
 from PySide6.QtTest import QTest
 from PySide6.QtWidgets import QApplication, QDialog, QMessageBox, QStackedWidget, QToolButton
 
@@ -126,9 +127,12 @@ class WorkbenchTests(unittest.TestCase):
 
     def test_canvas_modes_are_exclusive_and_leaving_canvas_clears_endpoint(self):
         window = self.window
-        actions = (window.place_action, window.place_coupler_action, window.connect_action)
+        placement = window.add_component_button.menu().actions()
+        self.assertEqual(placement, [window.place_action, window.place_coupler_action,
+                                     window.place_readout_action, window.place_filter_action])
+        actions = (*placement, window.connect_action)
         for chosen in actions:
-            chosen.setChecked(True)
+            chosen.trigger()
             self.assertEqual([action.isChecked() for action in actions], [action is chosen for action in actions])
         window.on_scene_clicked("device", self.alpha)
         self.assertEqual(window.first_endpoint, self.alpha)
@@ -145,6 +149,10 @@ class WorkbenchTests(unittest.TestCase):
         window.on_scene_clicked("device", self.beta)
         self.assertEqual(window.first_endpoint, self.beta)
         self.assertEqual(len(window.store.couplings()), 1)
+        window.design_button.click()
+        self.assertFalse(window.add_component_button.isEnabled())
+        window.design_button.click()
+        self.assertTrue(window.add_component_button.isEnabled())
 
     def test_editors_share_draft_across_refresh_pages_and_selection(self):
         window = self.window
@@ -361,6 +369,8 @@ class WorkbenchTests(unittest.TestCase):
         window = self.window
         self.select_device(self.alpha)
         self.bind_popup(self.alpha)
+        window.secondary_parameters.setChecked(True)
+        window._parameter_visibility_actions["qubit.f01"].setChecked(True)
         window.field_combo.setCurrentIndex(window.field_combo.findData("qubit.f01"))
         window.point_combo.setCurrentText("idle")
         self.process_events()
@@ -369,11 +379,10 @@ class WorkbenchTests(unittest.TestCase):
         labels = [item.toPlainText() for item in window.scene.items()
                   if hasattr(item, "toPlainText") and item.data(0) == ("device", self.alpha)]
         self.assertIn("5.7", labels)
-        frequency_column = next(c for c in range(window.data_table.columnCount())
-                                if "qubit.f01" in self.table_header(c))
-        alpha_row = next(r for r in range(window.data_table.rowCount())
-                         if window.data_table.item(r, 0).text() == self.alpha)
-        self.assertAlmostEqual(float(window.data_table.item(alpha_row, frequency_column).text()), 5.7)
+        frequency_row = next(r for r, key in window._table_parameter_positions.items() if key == "qubit.f01")
+        alpha_column = window._table_object_ids.index(self.alpha) + 1
+        self.assertFalse(window.data_table.isRowHidden(frequency_row))
+        self.assertAlmostEqual(float(window.data_table.item(frequency_row, alpha_column).text()), 5.7)
         window.tabs.setCurrentIndex(3)
         self.process_events()
         points = {window.history_table.item(r, 6).text() for r in range(window.history_table.rowCount())}
@@ -387,8 +396,8 @@ class WorkbenchTests(unittest.TestCase):
     def table_targets(self):
         return (("比特", "Q_beta", "device", self.beta),
                 ("耦合器", "C_main", "device", self.coupler),
-                ("比特-耦合器连接", "target-link", "link", self.link),
-                ("耦合", "target-coupling", "coupling", self.direct))
+                ("比特-耦合器连接", "Q_alpha", "link", self.link),
+                ("耦合", "Q_gamma", "coupling", self.direct))
 
     def test_horizontal_filter_double_click_keeps_object_identity(self):
         window = self.window
@@ -421,7 +430,7 @@ class WorkbenchTests(unittest.TestCase):
                 self.assertEqual(window.selected, (kind, ident))
         window.tabs.setCurrentIndex(1)
         window.table_kind.setCurrentText("比特")
-        window.filter_edit.setText("比特频率")
+        window.filter_edit.setText("顶点频率")
         visible_rows = [r for r in range(window.data_table.rowCount()) if not window.data_table.isRowHidden(r)]
         self.assertEqual(len(visible_rows), 1)
         self.assertFalse(any(window.data_table.isColumnHidden(c)
@@ -461,6 +470,41 @@ class WorkbenchTests(unittest.TestCase):
         confirm.assert_called_once()
         with self.assertRaises(KeyError):
             window.store.device(self.gamma)
+
+    def test_canvas_context_menu_deletes_right_clicked_device_and_supports_undo(self):
+        window = self.window
+        self.select_device(self.gamma)
+        window.place_readout_action.setChecked(True)
+        item = window.scene._device_items[self.alpha]
+        point = window.view.mapFromScene(item.mapToScene(item.boundingRect().center()))
+        viewport = window.view.viewport()
+        QTest.mouseClick(viewport, Qt.MouseButton.RightButton, pos=point)
+        self.assertIsNone(window.readout_start)
+
+        def open_menu():
+            event = QContextMenuEvent(QContextMenuEvent.Reason.Mouse, point, viewport.mapToGlobal(point))
+            self.app.sendEvent(viewport, event)
+            self.process_events()
+            self.assertTrue(window.detail_menu.isVisible())
+            self.assertEqual(window.selected, ("device", self.alpha))
+            self.assertFalse(window.device_popup.isVisible())
+
+        for choice in (QMessageBox.StandardButton.No, QMessageBox.StandardButton.Yes):
+            open_menu()
+            with patch.object(QMessageBox, "question", return_value=choice) as confirm:
+                QTest.mouseClick(window.detail_menu, Qt.MouseButton.LeftButton,
+                                 pos=window.detail_menu.actionGeometry(window.delete_action).center())
+                self.process_events()
+            self.assertIn("Q_alpha", confirm.call_args.args[2])
+            if choice == QMessageBox.StandardButton.No:
+                self.assertEqual(window.store.device(self.alpha)["label"], "Q_alpha")
+                self.assertFalse(window.undo_history.steps)
+        with self.assertRaises(KeyError):
+            window.store.device(self.alpha)
+        self.assertEqual(window.store.device(self.gamma)["label"], "Q_gamma")
+        window.undo_edit()
+        self.assertEqual(window.store.device(self.alpha)["label"], "Q_alpha")
+        self.assertAlmostEqual(window.store.current_values()[(self.alpha, "qubit.f01")], 5.1)
 
     def test_wiring_actions_require_line_selection(self):
         window = self.window

@@ -4,7 +4,7 @@ from PySide6.QtCore import QEvent, QObject, Qt
 from PySide6.QtGui import QKeySequence
 from PySide6.QtWidgets import (
     QApplication, QCheckBox, QComboBox, QDialog, QDoubleSpinBox,
-    QInputDialog, QLineEdit, QPlainTextEdit, QSpinBox, QWidget,
+    QInputDialog, QLineEdit, QPlainTextEdit, QSpinBox, QTableWidget, QWidget,
 )
 
 from .undo import EditHistory
@@ -23,7 +23,7 @@ class FormUndo(QObject):
             parent = control.parent()
             while parent is not None and parent is not dialog:
                 if (getattr(parent, "_is_attachment_panel", False)
-                        or isinstance(parent, (QComboBox, QDoubleSpinBox, QSpinBox))):
+                        or isinstance(parent, (QComboBox, QDoubleSpinBox, QSpinBox, QTableWidget))):
                     break
                 parent = parent.parent()
             if parent is not dialog:
@@ -73,6 +73,9 @@ def install_form_undo(dialog):
                   if getattr(widget, "_is_attachment_panel", False)), None)
     history = panel.undo_history if panel is not None else EditHistory()
     dialog._form_undo = FormUndo(dialog, history)
+    for widget in dialog.findChildren(QTableWidget):
+        if hasattr(widget, "attach_undo"):
+            widget.attach_undo(history)
 
 
 class UndoController(QObject):
@@ -106,6 +109,12 @@ class UndoController(QObject):
             return False
         dialog = watched.window()
         form = getattr(dialog, "_form_undo", None)
+        if form is not None and isinstance(watched, QLineEdit):
+            parent = watched.parent()
+            while parent is not None and parent is not dialog:
+                if isinstance(parent, QTableWidget) and hasattr(parent, "attach_undo"):
+                    return False
+                parent = parent.parent()
         if form is None:
             parent = watched
             shared = False

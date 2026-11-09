@@ -2,7 +2,7 @@ param([switch]$SkipLocalPublish)
 
 $ErrorActionPreference = 'Stop'
 $projectRoot = (Resolve-Path (Join-Path $PSScriptRoot '..')).Path
-$releaseVersion = '0.3.2'
+$releaseVersion = '0.3.3'
 $buildStamp = Get-Date -Format 'yyyyMMdd-HHmmss'
 $distPath = Join-Path $projectRoot "output/release/builds/$releaseVersion-$buildStamp"
 Set-Location -LiteralPath $projectRoot
@@ -45,6 +45,7 @@ Copy-Item -LiteralPath 'examples/surface_d3_complete_dark_wiring_ports.png' -Des
 Copy-Item -LiteralPath 'examples/surface_d3_complete_dark_coupling_g_effective.png' -Destination $examples -Force
 Copy-Item -LiteralPath 'docs/release-readme.md' -Destination (Join-Path $release 'README.md') -Force
 Copy-Item -LiteralPath 'docs/user-guide.md' -Destination $release -Force
+Copy-Item -LiteralPath 'docs/cryostat-wiring.md' -Destination $release -Force
 Copy-Item -LiteralPath 'docs/images' -Destination $release -Recurse -Force
 Copy-Item -LiteralPath 'output/pdf/user-guide.pdf' -Destination $release -Force
 Copy-Item -LiteralPath 'THIRD_PARTY_NOTICES.md' -Destination $release -Force
@@ -61,6 +62,8 @@ if (-not $SkipLocalPublish) {
     -ArchivePath $archive `
     -Version $releaseVersion `
     -BuildStamp $buildStamp
+    $release = Join-Path $projectRoot 'output/release/QubitSequencer'
+    $archive = Join-Path $projectRoot "output/release/QubitSequencer-$releaseVersion-win64.zip"
 }
 Write-Host "Build directory: $release"
 Write-Host "Build archive: $archive"

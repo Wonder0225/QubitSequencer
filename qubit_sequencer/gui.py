@@ -11,7 +11,7 @@ from PySide6.QtCore import QPoint, QRectF, QSettings, QSize, Qt, QTimer, QUrl
 from PySide6.QtGui import (QAction, QColor, QDesktopServices, QFont, QGuiApplication,
                            QIcon, QPainter, QPalette, QTextDocument, QTextOption)
 from PySide6.QtWidgets import (
-    QApplication, QComboBox, QDialog, QDialogButtonBox, QDoubleSpinBox, QFileDialog,
+    QApplication, QCheckBox, QComboBox, QDialog, QDialogButtonBox, QDoubleSpinBox, QFileDialog,
     QFormLayout, QGraphicsView, QHeaderView, QHBoxLayout, QInputDialog, QLabel, QLayout, QLineEdit,
     QGridLayout, QListWidget, QListWidgetItem, QMainWindow, QMenu, QMessageBox,
     QPushButton, QScrollArea, QSizePolicy, QSpinBox, QSplitter, QStackedWidget,
@@ -25,7 +25,13 @@ from .recent_files import RecentFiles, RecentFilesDialog
 from .attachment_ui import AttachmentPanel, AttachmentDialog, install_paste_shortcut
 from .design_ui import IMAGE_FILTER, read_design_file
 from .exports import build_tables, export_csv, export_xlsx
-from .storage import ChipStore
+from . import __version__
+from .storage import ChipStore, SCHEMA_VERSION
+from .device_types import DEVICE_NAMES, SUBTYPES
+from .readout_store import project_to_readout
+from .energy_levels import qubit_levels
+from .parameter_rules import (BIAS_Z_HEADERS, PARAMETER_HINTS, PI_PRODUCT, format_bias_z,
+                              is_secondary_parameter, record_value, uses_bias_z, validate_bias_z)
 from .templates import rotated_surface_code, square_grid
 from .tex_labels import tex_to_html
 from .theme import UI_COLORS, palette, stylesheet
@@ -33,11 +39,15 @@ from .ui_icons import icon
 from .workbench import WorkbenchLayout
 from .undo import EditHistory, undoable
 from .undo_ui import UndoController, install_form_undo
+from .wiring_ui import LineDialog
+from .wiring_store import METADATA, rows_text
 
 
 TYPE_NAMES = {"fixed_transmon": "固定 Transmon", "tunable_transmon": "可调 Transmon",
               "fixed_coupler": "固定耦合器", "tunable_coupler": "可调耦合器",
-              "direct": "直接电容", "coupler": "经耦合器"}
+              "direct": "直接电容", "coupler": "经耦合器",
+              "readout_line": "读取线", "tunable_filter": "可调 filter",
+              "horizontal": "横向", "vertical": "纵向", "angled": "自定义角度", "qubit": "比特", "filter": "可调 filter"}
 ROLE_NAMES = {"data": "数据比特", "measure_x": "X 测量", "measure_z": "Z 测量"}
 
 
@@ -53,13 +63,17 @@ def _table_key(headers, row):
     return str(row[0]) if row else ""
 
 
-def _table_fill(table: QTableWidget, headers: list[str], rows: list[list[object]]) -> None:
+def _table_fill(table: QTableWidget, headers: list[str], rows: list[list[object]], *,
+                default_widths: dict[str, int] | None = None) -> None:
     current = table.currentItem()
     selected_key = current.data(Qt.ItemDataRole.UserRole + 1) if current else None
     selected_header = table.horizontalHeaderItem(current.column()).toolTip() if current else None
     scroll_x, scroll_y = table.horizontalScrollBar().value(), table.verticalScrollBar().value()
     widths = {table.horizontalHeaderItem(c).toolTip(): table.columnWidth(c)
-              for c in range(table.columnCount()) if table.horizontalHeaderItem(c)}
+              for c in range(table.columnCount()) if table.horizontalHeaderItem(c) and not table.isColumnHidden(c)}
+    defaults = {"名称": 128, "对象": 128, "器件": 128, "类型": 140, "线路类型": 140}
+    if default_widths:
+        defaults.update(default_widths)
     table.setUpdatesEnabled(False)
     table.clear()
     table.setColumnCount(len(headers))
@@ -91,21 +105,17 @@ def _table_fill(table: QTableWidget, headers: list[str], rows: list[list[object]
     table.resizeColumnsToContents()
     table.verticalHeader().setDefaultSectionSize(34)
     table.setAlternatingRowColors(True)
-    table.setShowGrid(False)
+    table.setShowGrid(True)
     table.setWordWrap(False)
     table.horizontalHeader().setMinimumHeight(44)
     table.horizontalHeader().setMaximumHeight(44)
     for c, header in enumerate(headers):
         table.horizontalHeaderItem(c).setToolTip(header)
         table.horizontalHeaderItem(c).setTextAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
-        table.setColumnWidth(c, widths.get(header, min(280, max(92, table.columnWidth(c) + 8))))
+        fallback = defaults.get(header, min(280, max(92, table.columnWidth(c) + 8)))
+        table.setColumnWidth(c, widths.get(header, fallback))
     if headers and headers[0] in ("ID", "线路 ID", "对象 ID"):
         table.setColumnHidden(0, True)
-    for index, header in enumerate(headers):
-        if header in ("名称", "对象", "器件"):
-            table.setColumnWidth(index, widths.get(header, 128))
-        elif header in ("类型", "线路类型"):
-            table.setColumnWidth(index, widths.get(header, 140))
     if selected_row is not None and selected_header in headers:
         table.setCurrentCell(selected_row, headers.index(selected_header))
     table.horizontalScrollBar().setValue(scroll_x)
@@ -411,18 +421,27 @@ class ParameterDialog(QDialog):
         self.point = QLineEdit(point)
         self.bias = QLineEdit()
         self.bias_unit = QLineEdit()
+        bias_z = uses_bias_z(definition)
+        if bias_z:
+            self.bias.setPlaceholderText("零偏置填 0")
+            self.bias_unit.setPlaceholderText("原始控制值可留空")
         self.source = QLineEdit()
         self.notes = QLineEdit()
         fields = QGridLayout()
         for row, (left_label, left, right_label, right) in enumerate((
             (f"值 ({definition['unit'] or '无单位'})", self.value, "工作点", self.point),
-            ("偏置值", self.bias, "偏置单位", self.bias_unit),
+            ("BiasZ" if bias_z else "偏置值", self.bias, "偏置单位", self.bias_unit),
             ("来源/实验", self.source, "备注", self.notes),
         )):
             fields.addWidget(QLabel(left_label), row, 0); fields.addWidget(left, row, 1)
             fields.addWidget(QLabel(right_label), row, 2); fields.addWidget(right, row, 3)
         fields.setColumnStretch(1, 1); fields.setColumnStretch(3, 1)
         layout.addLayout(fields)
+        hint = ("登记频率时请同时填写该次测量的 BiasZ；仅在已知时填写单位。"
+                if bias_z else PARAMETER_HINTS.get(definition["key"]))
+        if hint:
+            label = QLabel(hint); label.setWordWrap(True); label.setProperty("role", "muted")
+            layout.addWidget(label)
         self.attachments = AttachmentPanel(parent=self)
         self.attachments.setMinimumHeight(250)
         layout.addWidget(QLabel("附件（可选）"))
@@ -440,6 +459,7 @@ class ParameterDialog(QDialog):
                     raise ValueError("数值必须是有限的数字")
             if not self.point.text().strip():
                 raise ValueError("请填写工作点名称")
+            validate_bias_z(self.definition, self.value.text().strip() or None, self.bias.text().strip() or None)
             self.attachments.inputs()
         except ValueError as exc:
             self.error.setText("请检查数值和偏置值" if "could not convert" in str(exc) else str(exc))
@@ -477,26 +497,20 @@ class DefinitionDialog(QDialog):
         _dialog_buttons(layout, self, "添加参数")
 
 
-class LineDialog(QDialog):
-    def __init__(self, parent=None, line=None):
-        super().__init__(parent)
-        self.setWindowTitle("登记制冷机线路")
-        layout = QFormLayout(self)
-        self.line_type = QComboBox(); self.line_type.setEditable(True)
-        self.line_type.addItems(["XY", "Z", "读出", "耦合器磁通", "其他"])
-        self.cryostat = QLineEdit(); self.port = QLineEdit(); self.channel = QLineEdit(); self.notes = QLineEdit()
-        if line is not None:
-            self.line_type.setCurrentText(line["line_type"])
-            self.cryostat.setText(line["cryostat"])
-            self.port.setText(line["port"])
-            self.channel.setText(line["channel"])
-            self.notes.setText(line["notes"])
-        layout.addRow("线路类型", self.line_type)
-        layout.addRow("制冷机", self.cryostat)
-        layout.addRow("端口", self.port)
-        layout.addRow("通道", self.channel)
-        layout.addRow("备注", self.notes)
-        _dialog_buttons(layout, self, "保存线路")
+def _apply_secondary_visibility(table, definitions, checkbox):
+    secondary = [is_secondary_parameter(d["key"]) for d in definitions]
+    checkbox.setVisible(any(secondary))
+    for index, hidden_by_default in enumerate(secondary):
+        table.setRowHidden(index, hidden_by_default and not checkbox.isChecked())
+
+
+def _annotate_bias_z(table, definitions, records, ident):
+    for index, definition in enumerate(definitions):
+        if uses_bias_z(definition):
+            bias = format_bias_z(records.get((ident, definition["key"])))
+            if bias is not None:
+                item = table.item(index, 1)
+                item.setToolTip(f"{item.text()} {definition['unit']} @ BiasZ {bias}")
 
 
 class DevicePopup(QDialog):
@@ -506,6 +520,7 @@ class DevicePopup(QDialog):
         super().__init__(host, Qt.WindowType.Popup)
         self.host = host
         self.device_id: str | None = None
+        self.definitions = []
         self.setWindowTitle("编辑芯片元件")
         self.resize(390, 560)
         layout = QVBoxLayout(self)
@@ -522,7 +537,11 @@ class DevicePopup(QDialog):
         fields.setFrameShape(QScrollArea.Shape.NoFrame)
         fields.setMinimumHeight(130); fields.setMaximumHeight(280)
         fields.setWidget(self.editor); layout.addWidget(fields)
+        self.readout_info = QLabel(); self.readout_info.setWordWrap(True); self.readout_info.setTextFormat(Qt.TextFormat.PlainText)
+        layout.addWidget(self.readout_info)
         layout.addWidget(QLabel("参数 · 双击一行登记新值"))
+        self.secondary_parameters = QCheckBox("显示次要参数")
+        layout.addWidget(self.secondary_parameters)
         self.parameters = QTableWidget(0, 2)
         delegate = TexTableDelegate(self.parameters); delegate.label_columns = {0}
         self.parameters.setItemDelegate(delegate)
@@ -530,6 +549,10 @@ class DevicePopup(QDialog):
         self.parameters.setAlternatingRowColors(True)
         self.parameters.cellDoubleClicked.connect(self.edit_parameter)
         layout.addWidget(self.parameters, 1)
+        self.secondary_parameters.toggled.connect(host.secondary_parameters.setChecked)
+        host.secondary_parameters.toggled.connect(self.secondary_parameters.setChecked)
+        self.secondary_parameters.toggled.connect(lambda: _apply_secondary_visibility(
+            self.parameters, self.definitions, self.secondary_parameters))
         buttons = QHBoxLayout()
         self.save_button = QPushButton("保存更改"); self.save_button.clicked.connect(self.save)
         self.save_button.setProperty("role", "primary")
@@ -565,16 +588,20 @@ class DevicePopup(QDialog):
             self.close()
             return False
         self.title.setText(f"<span>{tex_to_html(device['label'])}  ·  "
-                           f"{'比特' if device['kind'] == 'qubit' else '耦合器'}</span>")
+                           f"{DEVICE_NAMES[device['kind']]}</span>")
         self.editor.bind("device", self.device_id)
-        values = self.host.store.current_values(self.host.point_combo.currentText() or "default")
+        self.readout_info.setText(self.host.store.readout_summary(self.device_id))
+        self.readout_info.setVisible(bool(self.readout_info.text()))
+        point = self.host.point_combo.currentText() or "default"
+        records = self.host.store.current_records(point)
+        values = {key: record_value(record) for key, record in records.items()}
         self.definitions = self.host.store.definitions(device["kind"])
         rows = [[f"{d['label']} [{d['unit']}]" if d["unit"] else d["label"],
                  "未填写" if values.get((self.device_id, d["key"])) is None
                  else values[(self.device_id, d["key"])] ] for d in self.definitions]
-        _table_fill(self.parameters, ["参数", "当前值"], rows)
-        self.parameters.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
-        self.parameters.setColumnWidth(1, 100)
+        _table_fill(self.parameters, ["参数", "当前值"], rows, default_widths={"参数": 220, "当前值": 100})
+        _apply_secondary_visibility(self.parameters, self.definitions, self.secondary_parameters)
+        _annotate_bias_z(self.parameters, self.definitions, records, self.device_id)
         self._update_buttons()
         return True
 
@@ -625,7 +652,9 @@ class MainWindow(QMainWindow, WorkbenchLayout):
         self._initial_fit_pending = False
         self.selected: tuple[str, str] | None = None
         self.first_endpoint: str | None = None
+        self.readout_start = None
         self.visible_definitions = []
+        self._table_parameter_visibility = {}
         self.settings = QSettings("QubitSequencer", "QubitSequencer")
         self.recent_files = RecentFiles(self.settings)
         self.drafts = DraftRegistry(lambda: self.store, self)
@@ -638,6 +667,11 @@ class MainWindow(QMainWindow, WorkbenchLayout):
         self.setWindowTitle("Qubit Sequencer 芯片登记")
         self.resize(1450, 900)
         self._build_ui()
+        self.cancel_placement_action = QAction(self)
+        self.cancel_placement_action.setShortcut("Esc")
+        self.cancel_placement_action.triggered.connect(self._cancel_readout_placement)
+        self.addAction(self.cancel_placement_action)
+        self.view.setMouseTracking(True)
         geometry = self.settings.value("layout/geometry")
         if geometry:
             self.restoreGeometry(geometry)
@@ -687,9 +721,11 @@ class MainWindow(QMainWindow, WorkbenchLayout):
             self.settings.setValue("theme", self.theme)
         if self.store:
             self.refresh_scene()
+            self._refresh_energy_levels()
 
     def _sync_mode(self, chosen: QAction, checked: bool):
-        actions = (self.view_action, self.place_action, self.place_coupler_action, self.connect_action)
+        actions = (self.view_action, self.place_action, self.place_coupler_action,
+                   self.place_readout_action, self.place_filter_action, self.connect_action)
         if checked:
             for action in actions:
                 if action is not chosen:
@@ -697,11 +733,16 @@ class MainWindow(QMainWindow, WorkbenchLayout):
         elif not any(action.isChecked() for action in actions):
             self.view_action.blockSignals(True); self.view_action.setChecked(True); self.view_action.blockSignals(False)
         self.first_endpoint = None
+        self._cancel_readout_placement()
+        if checked and chosen in (self.place_readout_action, self.place_filter_action):
+            self.readout_visible_action.setChecked(True)
         if hasattr(self, "device_popup"):
             self.device_popup.close()
         hints = {self.view_action: "查看模式 · 拖动平移，滚轮缩放",
                  self.place_action: "放置比特 · 点击空格点",
                  self.place_coupler_action: "放置耦合器 · 点击空格点或半格",
+                 self.place_readout_action: "放置读取线 · 依次点击起点和终点，吸附格点／半格 · Esc 取消",
+                 self.place_filter_action: "放置可调 filter · 点击空格点或半格（可选元件）",
                  self.connect_action: "连接模式 · 依次点击两个器件"}
         active = next(action for action in actions if action.isChecked())
         if hasattr(self, "mode_hint"):
@@ -711,6 +752,23 @@ class MainWindow(QMainWindow, WorkbenchLayout):
     def fit_diagram(self):
         if self.scene:
             self.view.fit_chip()
+
+    def _cancel_readout_placement(self):
+        self.readout_start = None
+        if self.scene:
+            self.scene.set_readout_start(None)
+        if self.place_readout_action.isChecked():
+            self.mode_hint.setText("放置读取线 · 依次点击起点和终点，吸附格点／半格 · Esc 取消")
+
+    def _set_readout_visible(self, visible):
+        self.first_endpoint = None
+        self._cancel_readout_placement()
+        self.design_panel.readout_visible = visible
+        if not visible and self.design_panel.device_kind.currentData() in ("readout", "filter"):
+            self.design_panel.device_kind.setCurrentIndex(0)
+        self.design_panel.refresh_markers()
+        if self.store:
+            self.refresh_scene()
 
     def _error(self, title: str, exc: Exception | str):
         QMessageBox.critical(self, title, str(exc))
@@ -731,6 +789,7 @@ class MainWindow(QMainWindow, WorkbenchLayout):
         self._replay_edit(True)
 
     def _replay_edit(self, redo):
+        self._cancel_readout_placement()
         steps = self.undo_history.redo_steps if redo else self.undo_history.steps
         if not steps:
             return
@@ -800,6 +859,7 @@ class MainWindow(QMainWindow, WorkbenchLayout):
             if self.store:
                 self.store.close()
             self.store = incoming
+            self._cancel_readout_placement()
             self.scene = None
             self.selected = None
             saved_points = [row[0] for row in self.store.db.execute(
@@ -911,9 +971,9 @@ class MainWindow(QMainWindow, WorkbenchLayout):
         old = self.field_combo.currentData()
         self.field_combo.blockSignals(True)
         self.field_combo.clear(); self.field_combo.addItem("原始构型", "")
-        scope_order = {"qubit": 0, "coupling": 1, "link": 2, "coupler": 3}
+        scope_order = {"qubit": 0, "coupling": 1, "link": 2, "coupler": 3, "readout": 4, "filter": 5}
         for definition in sorted(self.store.definitions(), key=lambda d: scope_order[d["scope"]]):
-            scope = {"qubit": "比特", "coupler": "耦合器", "link": "连接", "coupling": "两比特耦合"}[definition["scope"]]
+            scope = {**DEVICE_NAMES, "link": "连接", "coupling": "两比特耦合"}[definition["scope"]]
             suffix = f" [{definition['unit']}]" if definition["unit"] else ""
             self.field_combo.addItem(f"{scope} · {definition['label']}{suffix}", definition["key"])
             self.field_combo.setItemData(self.field_combo.count()-1, definition["key"], Qt.ItemDataRole.ToolTipRole)
@@ -935,6 +995,7 @@ class MainWindow(QMainWindow, WorkbenchLayout):
         self.refresh_wiring()
         self.refresh_detail()
         self.design_panel.refresh(self.store)
+        self._refresh_energy_levels()
         if hasattr(self, "device_popup") and self.device_popup.isVisible():
             self.device_popup.reload()
         self._update_ui_state()
@@ -944,6 +1005,7 @@ class MainWindow(QMainWindow, WorkbenchLayout):
         self.refresh_scene()
         self.refresh_tables()
         self.refresh_detail()
+        self._refresh_energy_levels()
         if hasattr(self, "device_popup") and self.device_popup.isVisible():
             self.device_popup.reload()
         self._update_ui_state()
@@ -952,6 +1014,21 @@ class MainWindow(QMainWindow, WorkbenchLayout):
         self.selected = ("device", ident)
         self.refresh_detail()
         self.device_popup.show_device(ident, anchor)
+
+    def show_energy_levels(self):
+        if not self.store:
+            return
+        visible = self.chip_views.currentWidget() is not self.energy_panel
+        if visible:
+            self._refresh_energy_levels(force=True)
+        self._show_chip_view(2 if visible else 0)
+
+    def _refresh_energy_levels(self, *, force=False):
+        if self.store and (force or self.chip_views.currentWidget() is self.energy_panel):
+            point = self.point_combo.currentText() or "default"
+            frequency_key = self.energy_panel.frequency_source.currentData()
+            self.energy_panel.refresh(qubit_levels(self.store, point, frequency_key),
+                                      self.store.meta()["chip_name"], point, self.theme)
 
     def refresh_scene(self, *_):
         if not self.store:
@@ -963,9 +1040,12 @@ class MainWindow(QMainWindow, WorkbenchLayout):
             old_center = self.view.mapToScene(self.view.viewport().rect().center())
             old_transform = self.view.transform()
         self.scene = ChipScene(self.store, field,
-                               self.point_combo.currentText() or "default", self.theme)
+                               self.point_combo.currentText() or "default", self.theme,
+                               readout_visible=self.readout_visible_action.isChecked())
         self.scene.clicked.connect(self.on_scene_clicked)
         self.scene.blank_clicked.connect(self.on_blank_clicked)
+        self.scene.device_context_requested.connect(self.show_device_context_menu)
+        self.scene.set_readout_start(self.readout_start)
         self.view.setScene(self.scene)
         if old_center is None:
             self.view.fit_chip()
@@ -988,7 +1068,8 @@ class MainWindow(QMainWindow, WorkbenchLayout):
         if not self.store:
             return
         title = self.table_kind.currentText()
-        kind = {"比特": "device", "耦合器": "device", "比特-耦合器连接": "link",
+        kind = {"比特": "device", "耦合器": "device", "读取线": "device",
+                "可调 filter": "device", "读取线连接": "readout_link", "比特-耦合器连接": "link",
                 "耦合": "coupling"}.get(title)
         if self.table_orientation.currentData() == "vertical":
             ident = self._table_object_ids[_column-1] if 0 < _column <= len(self._table_object_ids) else None
@@ -1000,14 +1081,33 @@ class MainWindow(QMainWindow, WorkbenchLayout):
             self.tabs.setCurrentIndex(0)
             self.refresh_detail()
 
+    def show_device_context_menu(self, ident: str, anchor: QPoint):
+        self.device_popup.close()
+        self.selected = ("device", ident)
+        self.refresh_detail()
+        self.detail_menu.popup(anchor)
+
     def on_scene_clicked(self, kind: str, ident: str):
         anchor = self.scene.last_click_screen_pos if self.scene else None
+        scene_pos = self.scene.last_click_scene_pos if self.scene else None
+        if self.store and self.place_readout_action.isChecked() and (scene_pos is not None or kind == "device"):
+            x, y = self.scene.logical_at(scene_pos) if scene_pos is not None else (self.store.device(ident)["x"], self.store.device(ident)["y"])
+            self.scene.last_click_screen_pos = None; self.scene.last_click_scene_pos = None
+            self.on_blank_clicked(x, y)
+            return
+        if (self.store and kind == "device" and self.place_filter_action.isChecked()
+                and self.store.device(ident)["kind"] == "readout"):
+            x, y = self.scene.logical_at(scene_pos) if scene_pos is not None else (self.store.device(ident)["x"], self.store.device(ident)["y"])
+            self.scene.last_click_screen_pos = None; self.scene.last_click_scene_pos = None
+            self.on_blank_clicked(x, y, readout_id=ident)
+            return
         if self.scene:
             self.scene.last_click_screen_pos = None
+            self.scene.last_click_scene_pos = None
         if self.connect_action.isChecked() and kind == "device" and self.store:
             if self.first_endpoint is None:
                 self.first_endpoint = ident
-                self.statusBar().showMessage("已选择第一个器件，请点击比特或耦合器")
+                self.statusBar().showMessage("已选择第一个器件，请点击目标比特、耦合器、读取线或 filter")
                 return
             first = self.first_endpoint; self.first_endpoint = None
             if first == ident:
@@ -1020,32 +1120,65 @@ class MainWindow(QMainWindow, WorkbenchLayout):
             QTimer.singleShot(0, lambda: self.device_popup.show_device(ident, anchor))
 
     @undoable("放置器件")
-    def on_blank_clicked(self, x: float, y: float):
-        if not (self.place_action.isChecked() or self.place_coupler_action.isChecked()) or not self.store:
+    def on_blank_clicked(self, x: float, y: float, readout_id=None):
+        if not self.store:
+            return
+        kind = next((kind for action, kind in (
+            (self.place_action, "qubit"), (self.place_coupler_action, "coupler"),
+            (self.place_readout_action, "readout"), (self.place_filter_action, "filter")
+        ) if action.isChecked()), None)
+        if kind is None:
             return
         meta = self.store.meta()
-        if meta.get("template") == "surface":
+        if meta.get("template") == "surface" and kind in ("qubit", "coupler"):
             self._error("无法放置", "旋转表面码模板暂不支持通过方格底板放置；请新建自定义芯片")
             return
-        is_coupler = self.place_coupler_action.isChecked()
-        c, r = (round(x * 2) / 2, round(y * 2) / 2) if is_coupler else (round(x), round(y))
-        if any(d["x"] == c and d["y"] == r for d in self.store.devices()):
+        c, r = (round(x), round(y)) if kind == "qubit" else (round(x * 2) / 2, round(y * 2) / 2)
+        endpoints = None
+        if kind == "readout":
+            if self.readout_start is None:
+                self.readout_start = (c, r)
+                self.scene.set_readout_start(self.readout_start)
+                self.mode_hint.setText(f"读取线起点 ({c:g}, {r:g}) · 请选择终点 · Esc 取消")
+                return
+            if self.readout_start == (c, r):
+                self.mode_hint.setText("终点与起点重合，请选择其他格点／半格点 · Esc 取消")
+                return
+            endpoints = (self.readout_start, (c, r))
+            c, r = (endpoints[0][0]+c)/2, (endpoints[0][1]+r)/2
+            self._cancel_readout_placement()
+        filter_position = None
+        if kind == "filter":
+            obstacles = self.store.devices()
+            candidates = []
+            for readout in self.store.devices("readout"):
+                position, (sx, sy) = project_to_readout(readout, x, y, obstacles)
+                distance = math.hypot(sx-x, sy-y)
+                if readout_id == readout["id"] or (readout_id is None and distance <= .25):
+                    candidates.append((distance, readout["id"], position, sx, sy))
+            if candidates:
+                _, readout_id, filter_position, c, r = min(candidates)
+        if kind != "readout" and any(d["x"] == c and d["y"] == r and d["id"] != readout_id for d in self.store.devices()):
             self._error("位置已占用", f"({c:g}, {r:g}) 已有器件")
             return
-        default_label = f"C_{r:g}_{c:g}" if is_coupler else f"Q_{r:g}_{c:g}"
-        label, ok = QInputDialog.getText(self, "放置耦合器" if is_coupler else "放置比特",
-                                         "器件名称（支持 Q_{1}、\\omega_{01}）", text=default_label)
+        default_label = self.store.next_device_label(kind)
+        name_prompt = ("器件名称（保留默认值时，连接两个比特后自动命名）" if kind == "coupler" else
+                       "器件名称（支持 q_{1}、\\omega_{01}）")
+        label, ok = QInputDialog.getText(self, f"放置{DEVICE_NAMES[kind]}", name_prompt, text=default_label)
         if not ok or not label.strip():
             return
-        choices = ["可调耦合器", "固定耦合器"] if is_coupler else ["可调 Transmon", "不可调 Transmon"]
-        subtype, ok = QInputDialog.getItem(self, "器件类型", "类型", choices, 0, False)
-        if not ok:
-            return
+        choices = SUBTYPES[kind]
+        device_type = choices[-1][1]
+        if len(choices) > 1:
+            subtype, ok = QInputDialog.getItem(self, "器件类型", "类型",
+                                             [caption for caption, _ in reversed(choices)], 0, False)
+            if not ok:
+                return
+            device_type = next(value for caption, value in choices if caption == subtype)
         try:
-            kind = "coupler" if is_coupler else "qubit"
-            device_type = ("tunable_coupler" if subtype.startswith("可调") else "fixed_coupler") if is_coupler else (
-                "tunable_transmon" if subtype.startswith("可调") else "fixed_transmon")
-            ident = self.store.add_device(kind, device_type, label, c, r)
+            ident = self.store.add_device(kind, device_type, None if label.strip() == default_label else label, c, r,
+                                          readout_id=readout_id, readout_position=filter_position,
+                                          readout_endpoints=endpoints)
             self.selected = ("device", ident)
             self.refresh_content()
             self._written("器件")
@@ -1060,6 +1193,12 @@ class MainWindow(QMainWindow, WorkbenchLayout):
         mediator = None
         try:
             kind_a, kind_b = self.store.device(first)["kind"], self.store.device(second)["kind"]
+            if "readout" in (kind_a, kind_b) and ({kind_a, kind_b} & {"qubit", "filter"}):
+                readout_id, device_id = (first, second) if kind_a == "readout" else (second, first)
+                link = self.store.add_readout_link(readout_id, device_id)
+                self.selected = ("readout_link", link)
+                self.refresh_content(); self._written("读取线关联")
+                return
             if {kind_a, kind_b} == {"qubit", "coupler"}:
                 qid = first if kind_a == "qubit" else second
                 cid = first if kind_a == "coupler" else second
@@ -1069,14 +1208,10 @@ class MainWindow(QMainWindow, WorkbenchLayout):
                 self._written("连接")
                 return
             if kind_a != "qubit" or kind_b != "qubit":
-                raise ValueError("请选择两个比特，或一个比特与一个耦合器")
+                raise ValueError("请选择两比特、比特与耦合器，或读取线与比特／filter")
             if mode == "coupler":
                 a, b = self.store.device(first), self.store.device(second)
-                labels = {d["label"] for d in self.store.devices()}
-                n = 1
-                while f"C_{n}" in labels:
-                    n += 1
-                mediator = self.store.add_device("coupler", "tunable_coupler", f"C_{n}",
+                mediator = self.store.add_device("coupler", "tunable_coupler", None,
                                                   (a["x"] + b["x"]) / 2, (a["y"] + b["y"]) / 2)
             ident = self.store.add_coupling(first, second, mode, mediator)
             self.selected = ("coupling", ident)
@@ -1088,22 +1223,34 @@ class MainWindow(QMainWindow, WorkbenchLayout):
             self._error("连接失败", exc)
 
     def refresh_detail(self):
+        headers = ["参数", "当前值", "单位"]
+        default_widths = {"参数": 128, "当前值": 80, "单位": 52}
         if not self.store or not self.selected:
+            self.readout_info.clear()
             self.selected_title.setText("点击图上的器件或连接查看详情")
             self.detail_editor.clear()
             self.visible_definitions = []
-            _table_fill(self.parameter_table, ["参数", "当前值", "单位"], [])
+            _table_fill(self.parameter_table, headers, [], default_widths=default_widths)
+            self.secondary_parameters.hide()
             self._update_ui_state()
             return
         kind, ident = self.selected
+        self.readout_info.clear()
         try:
             self.detail_editor.bind(kind, ident)
             self.save_button.setText("保存更改")
             if kind == "device":
                 obj = self.store.device(ident)
                 scope = obj["kind"]
-                self.selected_title.setText(f"<b>{tex_to_html(obj['label'])}</b> · {'比特' if scope == 'qubit' else '耦合器'}")
+                self.selected_title.setText(f"<b>{tex_to_html(obj['label'])}</b> · {DEVICE_NAMES[scope]}")
                 name = obj["label"]
+                self.readout_info.setText(self.store.readout_summary(ident))
+            elif kind == "readout_link":
+                obj = self.store.readout_link(ident); scope = "readout_link"
+                a = self.store.device(obj["readout_id"])["label"]
+                b = self.store.device(obj["device_id"])["label"]
+                name = f"{a} — {b}"
+                self.selected_title.setText(f"<b>{tex_to_html(name)}</b><br>读取线关联")
             elif kind == "coupling":
                 obj = self.store.coupling(ident)
                 scope = "coupling"
@@ -1122,19 +1269,22 @@ class MainWindow(QMainWindow, WorkbenchLayout):
             self.selected_title.setToolTip(ident)
             self.delete_action.setText(f"删除 {name}")
             self.visible_definitions = self.store.definitions(scope)
-            values = self.store.current_values(self.point_combo.currentText() or "default")
+            records = self.store.current_records(self.point_combo.currentText() or "default")
+            values = {key: record_value(record) for key, record in records.items()}
             rows = [[d["label"], "未填写" if values.get((ident, d["key"])) is None else values[(ident, d["key"])],
                      d["unit"]] for d in self.visible_definitions]
-            _table_fill(self.parameter_table, ["参数", "当前值", "单位"], rows)
+            _table_fill(self.parameter_table, headers, rows, default_widths=default_widths)
+            self._refresh_secondary_parameters()
+            _annotate_bias_z(self.parameter_table, self.visible_definitions, records, ident)
             for row, definition in enumerate(self.visible_definitions):
                 self.parameter_table.item(row, 0).setToolTip(f"{definition['label']}\n{definition['key']}")
-            self.parameter_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
-            self.parameter_table.setColumnWidth(1, 80)
-            self.parameter_table.setColumnWidth(2, 52)
             self._update_ui_state()
         except KeyError:
             self.selected = None
             self.refresh_detail()
+
+    def _refresh_secondary_parameters(self):
+        _apply_secondary_visibility(self.parameter_table, self.visible_definitions, self.secondary_parameters)
 
     def save_device(self):
         if not self.store or not self.selected:
@@ -1158,11 +1308,14 @@ class MainWindow(QMainWindow, WorkbenchLayout):
         dialog = ParameterDialog(definition, self.point_combo.currentText() or "default", self)
         if anchor is not None:
             dialog.move(anchor)
-        old_value = self.store.current_values(self.point_combo.currentText() or "default").get(
-            (self.selected[1], definition["key"])
-        )
+        old_record = self.store.current_records(self.point_combo.currentText() or "default").get(
+            (self.selected[1], definition["key"]))
+        old_value = record_value(old_record)
         if old_value is not None:
             dialog.value.setText(str(old_value))
+        if old_record is not None and uses_bias_z(definition) and old_record["bias_value"] is not None:
+            dialog.bias.setText(str(old_record["bias_value"]))
+            dialog.bias_unit.setText(old_record["bias_unit"])
         while dialog.exec() == QDialog.DialogCode.Accepted:
             try:
                 raw = dialog.value.text().strip()
@@ -1200,6 +1353,8 @@ class MainWindow(QMainWindow, WorkbenchLayout):
                                       dialog.category.currentData())
             self._refresh_field_options()
             self.refresh_content()
+            if is_secondary_parameter(dialog.key.text().strip()):
+                self.secondary_parameters.setChecked(True)
         except Exception as exc:
             self._error("新增字段失败", exc)
 
@@ -1215,9 +1370,13 @@ class MainWindow(QMainWindow, WorkbenchLayout):
         try:
             if kind == "device":
                 self.store.delete_device(ident)
+                if self.first_endpoint == ident:
+                    self.first_endpoint = None
             elif kind == "coupling":
                 coupling = self.store.coupling(ident)
                 self.store.delete_coupling(ident)
+            elif kind == "readout_link":
+                self.store.delete_readout_link(ident)
             else:
                 self.store.delete_link(ident)
             self.selected = None
@@ -1231,6 +1390,23 @@ class MainWindow(QMainWindow, WorkbenchLayout):
             return
         title = self.table_kind.currentText()
         headers, rows = build_tables(self.store, self.point_combo.currentText() or "default")[title]
+        if "备注" in headers:
+            index = headers.index("备注")
+            headers = headers[:index] + headers[index + 1:]
+            rows = [row[:index] + row[index + 1:] for row in rows]
+        definitions = {d['key']: d for d in self.store.definitions()}
+        self._table_parameter_fields = []
+        parameter_positions = {}
+        bias_keys = {header: key for key, header in BIAS_Z_HEADERS.items()}
+        for index, header in enumerate(headers):
+            key = header.rsplit(" (", 1)[-1][:-1] if " (" in header and header.endswith(")") else ""
+            if key in definitions or key == PI_PRODUCT:
+                category = ("secondary" if is_secondary_parameter(key) else
+                            definitions[key]["category"] if key in definitions else "measured")
+                self._table_parameter_fields.append((index, key, header, category))
+                parameter_positions[index] = key
+            elif title == "比特" and header in bias_keys:
+                parameter_positions[index] = bias_keys[header]
         self._table_object_ids = [str(row[0]) for row in rows]
         if self.table_orientation.currentData() == "vertical":
             field_indices = list(range(1, len(headers))) if headers and headers[0] in ("ID", "线路 ID") else list(range(len(headers)))
@@ -1238,7 +1414,7 @@ class MainWindow(QMainWindow, WorkbenchLayout):
                           "耦合": 1, "接线": 5}.get(title, 1)
             object_headers = [str(row[name_index]) if name_index < len(row) else str(i+1)
                               for i, row in enumerate(rows)]
-            if title == "比特-耦合器连接":
+            if title in ("比特-耦合器连接", "读取线连接"):
                 object_headers = [f"{row[1]} — {row[2]}" for row in rows]
             elif title == "耦合":
                 object_headers = [f"{row[1]} — {row[2]}" for row in rows]
@@ -1248,22 +1424,22 @@ class MainWindow(QMainWindow, WorkbenchLayout):
                             else header for header in (headers[index] for index in field_indices)]
             transposed = [[label] + [row[index] for row in rows]
                           for label, index in zip(field_labels, field_indices)]
-            _table_fill(self.data_table, ["参数 / 字段"] + object_headers, transposed)
+            _table_fill(self.data_table, ["参数 / 字段"] + object_headers, transposed,
+                        default_widths=dict.fromkeys(object_headers, 145) | {"参数 / 字段": 220})
             for row_index, index in enumerate(field_indices):
                 self.data_table.item(row_index, 0).setToolTip(headers[index])
-                if headers[index] in ("类型", "方式", "角色"):
+                if headers[index] in ("类型", "方式", "角色", "方向", "元件类别"):
                     mapping = ROLE_NAMES if headers[index] == "角色" else TYPE_NAMES
                     for column in range(1, self.data_table.columnCount()):
                         item = self.data_table.item(row_index, column)
                         item.setText(str(mapping.get(item.data(Qt.ItemDataRole.UserRole), item.text())))
-            self.data_table.setColumnWidth(0, 220)
-            for col in range(1, self.data_table.columnCount()):
-                self.data_table.setColumnWidth(col, 145)
             self.tex_delegate.label_columns = {0}
             self.tex_delegate.label_rows = {
                 row_index for row_index, index in enumerate(field_indices)
                 if headers[index] in ("名称", "比特", "耦合器", "比特 A", "比特 B", "器件", "对象")
             }
+            self._table_parameter_positions = {row: parameter_positions[index]
+                                               for row, index in enumerate(field_indices) if index in parameter_positions}
         else:
             _table_fill(self.data_table, headers, rows)
             self.tex_delegate.label_columns = {
@@ -1271,6 +1447,7 @@ class MainWindow(QMainWindow, WorkbenchLayout):
                 if header in ("名称", "比特", "耦合器", "比特 A", "比特 B", "器件", "对象")
             }
             self.tex_delegate.label_rows = set()
+            self._table_parameter_positions = parameter_positions
         for index, header in enumerate(["参数 / 字段"] + object_headers if self.table_orientation.currentData() == "vertical" else headers):
             item = self.data_table.horizontalHeaderItem(index)
             if item:
@@ -1278,6 +1455,43 @@ class MainWindow(QMainWindow, WorkbenchLayout):
                 item.setText("")
         self.data_table.setColumnHidden(0, self.table_orientation.currentData() == "horizontal" and
                                         bool(headers) and headers[0] in ("ID", "线路 ID"))
+        self.parameter_visibility_button.setEnabled(bool(self._table_parameter_fields))
+        self._build_parameter_menu()
+        self.filter_table()
+
+    def _build_parameter_menu(self):
+        self.parameter_visibility_menu.clear()
+        self._parameter_visibility_actions = {}
+        show_all = self.parameter_visibility_menu.addAction("全部显示")
+        show_all.triggered.connect(lambda: self._show_all_table_parameters(True))
+        hide_all = self.parameter_visibility_menu.addAction("全部隐藏")
+        hide_all.triggered.connect(lambda: self._show_all_table_parameters(False))
+        self.parameter_visibility_menu.addSeparator()
+        for category, title in [("measured", "测量参数"), ("secondary", "次要参数"),
+                                ("design", "设计参数"), ("custom", "自定义参数")]:
+            fields = [f for f in self._table_parameter_fields if f[3] == category]
+            if not fields:
+                continue
+            group = self.parameter_visibility_menu.addMenu(title)
+            for _, key, header, _ in fields:
+                document = QTextDocument(); document.setHtml(tex_to_html(_visible_header(header)))
+                action = group.addAction(document.toPlainText())
+                action.setToolTip(header); action.setData(key); action.setCheckable(True)
+                action.setChecked(self._is_table_parameter_visible(key))
+                action.toggled.connect(lambda checked, k=key: self._set_table_parameter_visible(k, checked))
+                self._parameter_visibility_actions[key] = action
+
+    def _set_table_parameter_visible(self, key, visible):
+        self._table_parameter_visibility[key] = visible
+        self.filter_table()
+
+    def _is_table_parameter_visible(self, key):
+        return self._table_parameter_visibility.get(key, not is_secondary_parameter(key))
+
+    def _show_all_table_parameters(self, visible):
+        for key, action in self._parameter_visibility_actions.items():
+            self._table_parameter_visibility[key] = visible
+            action.blockSignals(True); action.setChecked(visible); action.blockSignals(False)
         self.filter_table()
 
     def filter_table(self, *_):
@@ -1288,7 +1502,8 @@ class MainWindow(QMainWindow, WorkbenchLayout):
                              for r in range(self.data_table.rowCount())]
             by_field = bool(needle) and any(field_matches)
             for r in range(self.data_table.rowCount()):
-                self.data_table.setRowHidden(r, by_field and not field_matches[r])
+                self.data_table.setRowHidden(r, (by_field and not field_matches[r]) or
+                    not self._is_table_parameter_visible(self._table_parameter_positions.get(r)))
             for c in range(1, self.data_table.columnCount()):
                 heading = self.data_table.horizontalHeaderItem(c)
                 haystack = " ".join([str(heading.data(Qt.ItemDataRole.UserRole) or "") if heading else ""] +
@@ -1298,6 +1513,8 @@ class MainWindow(QMainWindow, WorkbenchLayout):
             visible = sum(not self.data_table.isColumnHidden(c) for c in range(1, self.data_table.columnCount()))
             self.table_summary.setText(f"{visible} / {max(0, self.data_table.columnCount()-1)} 个对象 · 工作点 {self.point_combo.currentText()} · 双击对象数据查看详情")
             return
+        for column in range(1, self.data_table.columnCount()):
+            self.data_table.setColumnHidden(column, not self._is_table_parameter_visible(self._table_parameter_positions.get(column)))
         for r in range(self.data_table.rowCount()):
             haystack = " ".join(self.data_table.item(r, c).text() for c in range(self.data_table.columnCount())
                                 if self.data_table.item(r, c))
@@ -1360,23 +1577,67 @@ class MainWindow(QMainWindow, WorkbenchLayout):
         if self.store:
             headers, rows = build_tables(self.store)["接线"]
             _table_fill(self.wiring_table, headers, rows)
+            for column in range(12, len(headers)):
+                self.wiring_table.setColumnHidden(column, True)
+            lines = self.store.lines()
+            for combo, title, options in [
+                (self.wiring_board, "全部盘号", sorted({self.store.line_details(line['id']).get('board', '') for line in lines} - {''})),
+                (self.wiring_usage, "全部用途", sorted({line['line_type'] for line in lines})),
+            ]:
+                selected = combo.currentText()
+                combo.blockSignals(True); combo.clear(); combo.addItem(title); combo.addItems(options)
+                combo.setCurrentText(selected if combo.findText(selected) >= 0 else title)
+                combo.blockSignals(False)
+        self.filter_wiring()
+        self.refresh_wiring_detail()
+
+    def filter_wiring(self, *_):
+        needle = self.wiring_search.text().casefold().strip()
+        board = self.wiring_board.currentText() if self.wiring_board.currentIndex() > 0 else ""
+        usage = self.wiring_usage.currentText() if self.wiring_usage.currentIndex() > 0 else ""
+        for row in range(self.wiring_table.rowCount()):
+            values = [self.wiring_table.item(row, col).text() for col in range(self.wiring_table.columnCount())]
+            hidden = bool((board and values[7] != board) or (usage and values[1] != usage)
+                          or (needle and needle not in ' '.join(values).casefold()))
+            self.wiring_table.setRowHidden(row, hidden)
+        current = self.wiring_table.currentRow()
+        if current >= 0 and self.wiring_table.isRowHidden(current):
+            self.wiring_table.clearSelection()
+        self._update_ui_state()
+
+    def refresh_wiring_detail(self):
+        ident = self._chosen_line_id()
+        if not self.store or not ident:
+            self.wiring_detail.setText("选择线路查看温级配置、放大链与检线记录；双击线路可编辑。")
+            return
+        line = self.store.line(ident); details = self.store.line_details(ident)
+        parts = [f"{line['cryostat']} · {details.get('board', '')}盘 · {line['port']} · {line['line_type']}"]
+        mapping = "；".join(f"{label}：{details[key]}" for key, label in METADATA if details.get(key))
+        if mapping:
+            parts.append(mapping)
+        for key, title in [("components", "温级元件"), ("amplifiers", "放大链"),
+                           ("biases", "放大器工作参数"), ("checks", "检线记录")]:
+            text = rows_text(details, key)
+            if text:
+                parts.append(f"{title}\n{text}")
+        self.wiring_detail.setText('\n\n'.join(parts))
 
     @undoable("添加制冷机线路")
     def add_line(self):
         if not self.store:
             return
         dialog = LineDialog(self)
-        if dialog.exec() != QDialog.DialogCode.Accepted:
-            return
         selected_device = (self.selected[1] if self.selected and self.selected[0] == "device" else None)
-        try:
-            self.store.add_line(dialog.line_type.currentText(), dialog.cryostat.text(), dialog.port.text(),
-                                dialog.channel.text(), dialog.notes.text(),
-                                [selected_device] if selected_device else [])
-            self.refresh_content()
-            self._written("线路")
-        except Exception as exc:
-            self._error("线路登记失败", exc)
+        while dialog.exec() == QDialog.DialogCode.Accepted:
+            try:
+                self.store.add_line(dialog.line_type.currentText(), dialog.cryostat.text(), dialog.port.text(),
+                                    dialog.channel.text(), dialog.notes.text(),
+                                    [selected_device] if selected_device else [], details=dialog.details())
+                self.refresh_content()
+                self._written("线路")
+                return
+            except Exception as exc:
+                dialog.error.setText(f"线路登记失败：{exc}")
 
     def _chosen_line_id(self):
         if not self.wiring_table.selectionModel().hasSelection():
@@ -1388,16 +1649,16 @@ class MainWindow(QMainWindow, WorkbenchLayout):
     def edit_line(self):
         if not self.store or not (line_id := self._chosen_line_id()):
             return
-        dialog = LineDialog(self, self.store.line(line_id))
-        if dialog.exec() != QDialog.DialogCode.Accepted:
-            return
-        try:
-            self.store.update_line(line_id, dialog.line_type.currentText(), dialog.cryostat.text(),
-                                   dialog.port.text(), dialog.channel.text(), dialog.notes.text())
-            self.refresh_content()
-            self._written("线路")
-        except Exception as exc:
-            self._error("编辑线路失败", exc)
+        dialog = LineDialog(self, self.store.line(line_id), self.store.line_details(line_id))
+        while dialog.exec() == QDialog.DialogCode.Accepted:
+            try:
+                self.store.update_line(line_id, dialog.line_type.currentText(), dialog.cryostat.text(),
+                                       dialog.port.text(), dialog.channel.text(), dialog.notes.text(), details=dialog.details())
+                self.refresh_content()
+                self._written("线路")
+                return
+            except Exception as exc:
+                dialog.error.setText(f"编辑线路失败：{exc}")
 
     def assign_line(self):
         if not self.store or not (line_id := self._chosen_line_id()):
@@ -1491,7 +1752,7 @@ class MainWindow(QMainWindow, WorkbenchLayout):
         try:
             export_diagram(self.store, path, self.field_combo.currentData() or "",
                            self.point_combo.currentText() or "default", width,
-                           theme=self.theme)
+                           theme=self.theme, readout_visible=self.readout_visible_action.isChecked())
             self.statusBar().showMessage(f"图片已导出：{path}")
         except Exception as exc:
             self._error("图片导出失败", exc)
@@ -1518,7 +1779,7 @@ class MainWindow(QMainWindow, WorkbenchLayout):
                 name = field or "topology"
                 export_diagram(self.store, Path(directory) / f"{name}.{fmt.lower()}",
                                field, self.point_combo.currentText() or "default",
-                               theme=self.theme)
+                               theme=self.theme, readout_visible=self.readout_visible_action.isChecked())
             self.statusBar().showMessage(f"已导出 {len(fields)} 张图片到 {directory}")
         except Exception as exc:
             self._error("批量导出失败", exc)
@@ -1529,6 +1790,16 @@ class MainWindow(QMainWindow, WorkbenchLayout):
             QDesktopServices.openUrl(QUrl.fromLocalFile(str(path)))
         else:
             self._error("说明文件不存在", path)
+
+    def show_version_info(self):
+        from .migrations import MIGRATIONS
+        supported = "、".join(f"v{version}" for version in sorted((*MIGRATIONS, SCHEMA_VERSION)))
+        QMessageBox.information(self, "版本信息",
+                                f"Qubit Sequencer\n软件版本：{__version__}\n\n"
+                                f"当前 .qchip 文件格式：v{SCHEMA_VERSION}\n"
+                                f"支持打开的 .qchip 文件版本：{supported}\n\n"
+                                "旧版本项目打开时会先自动备份，再升级到当前格式。\n"
+                                f"高于 v{SCHEMA_VERSION} 的项目暂不支持。")
 
     def closeEvent(self, event):
         if not self._leave_file():

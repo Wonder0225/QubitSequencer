@@ -9,6 +9,7 @@ from openpyxl import load_workbook
 from qubit_sequencer.exports import build_tables, export_csv, export_xlsx
 from qubit_sequencer.storage import ChipStore, SCHEMA_VERSION
 from qubit_sequencer.templates import rotated_surface_code, square_grid
+from qubit_sequencer.undo import EditHistory
 
 
 class StoreTests(unittest.TestCase):
@@ -66,6 +67,7 @@ class StoreTests(unittest.TestCase):
         with ChipStore.create(self.path, "格子", "square") as store:
             square_grid(store, 3, 4, "direct")
             self.assertEqual(len(store.devices("qubit")), 12)
+            self.assertEqual({d["label"] for d in store.devices("qubit")}, {f"q_{{{n}}}" for n in range(1, 13)})
             self.assertEqual(len(store.couplings()), 17)
             self.assertEqual(store.validate(), [])
         large_path = Path(self.tmp.name) / "square_6.qchip"
@@ -86,10 +88,15 @@ class StoreTests(unittest.TestCase):
                 self.assertEqual(sum(d["role"] == "measure_z" for d in qubits), (distance * distance - 1) // 2)
                 self.assertEqual(len(store.couplings()), expected_edges)
                 self.assertEqual(len(store.devices("coupler")), expected_edges)
+                self.assertEqual({q["label"] for q in qubits}, {f"q_{{{n}}}" for n in range(1, len(qubits) + 1)})
                 roles = {q["id"]: q["role"] for q in qubits}
+                indices = {q["id"]: int(q["label"][3:-1]) for q in qubits}
                 neighbors = {q["id"]: set() for q in qubits if q["role"] != "data"}
                 for edge in store.couplings():
                     a, b = edge["qubit_a"], edge["qubit_b"]
+                    low, high = sorted((indices[a], indices[b]))
+                    separator = "" if high < 10 else ","
+                    self.assertEqual(store.device(edge["coupler_id"])["label"], f"c_{{{low}{separator}{high}}}")
                     if a in neighbors:
                         neighbors[a].add(b)
                     if b in neighbors:
@@ -98,6 +105,56 @@ class StoreTests(unittest.TestCase):
                 zs = [v for k, v in neighbors.items() if roles[k] == "measure_z"]
                 self.assertTrue(all(len(x & z) % 2 == 0 for x in xs for z in zs))
                 self.assertEqual(store.validate(), [])
+
+    def test_device_names_follow_placement_sequence_after_delete_and_reopen(self):
+        with ChipStore.create(self.path, "编号测试") as store:
+            existing = store.add_device("qubit", "fixed_transmon", "Q_4_8", 8, 4)
+            with store.db:
+                store.db.execute("DELETE FROM meta WHERE key='device_sequence.qubit'")
+            self.assertEqual(store.next_device_label("qubit"), "q_{2}")
+            q = store.add_device("qubit", "fixed_transmon", None, -3, 9)
+            self.assertEqual(store.device(q)["label"], "q_{2}")
+            self.assertEqual(store.device(existing)["label"], "Q_4_8")
+            store.update_device(q, label="控制比特")
+            store.delete_device(q)
+            c = store.add_device("coupler", "fixed_coupler", "q_3", 1.5, 0)
+            r = store.add_device("readout", "readout_line", None, 0, 2)
+            f = store.add_device("filter", "tunable_filter", None, 1, 2)
+            self.assertEqual((store.device(r)["label"], store.device(f)["label"]), ("r_{1}", "f_{1}"))
+        with ChipStore.open(self.path) as store:
+            self.assertEqual(store.next_device_label("qubit"), "q_{4}")
+            self.assertEqual(store.next_device_label("coupler"), "c_{2}")
+            q = store.add_device("qubit", "fixed_transmon", None, 4, -2)
+            self.assertEqual(store.device(q)["label"], "q_{4}")
+            self.assertEqual(store.device(c)["label"], "q_3")
+            self.assertEqual(store.next_device_label("qubit"), "q_{5}")
+
+    def test_coupler_name_waits_for_both_links_and_respects_saved_override(self):
+        with ChipStore.create(self.path, "耦合器命名") as store:
+            a = store.add_device("qubit", "fixed_transmon", None, 0, 0)
+            b = store.add_device("qubit", "fixed_transmon", "Q10", 1, 0)
+            c = store.add_device("coupler", "fixed_coupler", None, .5, 0)
+            store.add_link(b, c)
+            self.assertEqual(store.device(c)["label"], "c_{1}")
+        with ChipStore.open(self.path) as store:
+            history = EditHistory()
+            history.bind(store.db)
+            store.undo_history = history
+            link = store.add_link(a, c)
+            self.assertEqual(store.device(c)["label"], "c_{1,10}")
+            history.undo()
+            self.assertEqual(store.device(c)["label"], "c_{1}")
+            self.assertEqual(len(store.links(c)), 1)
+            history.redo()
+            self.assertEqual(store.device(c)["label"], "c_{1,10}")
+            duplicate = store.add_device("coupler", "fixed_coupler", None, .5, 1)
+            store.add_coupling(a, b, "coupler", duplicate)
+            self.assertEqual(store.device(duplicate)["label"], "c_{1,10,2}")
+            store.update_device(c, label="自定义耦合器")
+            store.delete_link(link)
+            store.add_link(a, c)
+            self.assertEqual(store.device(c)["label"], "自定义耦合器")
+            history.detach()
 
     def test_tables_xlsx_and_csv_preserve_zero_and_empty(self):
         with ChipStore.create(self.path, "导出样片") as store:
@@ -115,9 +172,9 @@ class StoreTests(unittest.TestCase):
             export_xlsx(store, xlsx, "idle", True)
             csv_dir = Path(self.tmp.name) / "csv"
             written = export_csv(store, csv_dir, "idle", True)
-            self.assertEqual(len(written), 7)
+            self.assertEqual(len(written), 10)
             wb = load_workbook(xlsx, read_only=True)
-            self.assertEqual(wb.sheetnames, ["芯片信息", "比特", "耦合器", "耦合", "比特-耦合器连接", "接线", "参数历史"])
+            self.assertEqual(wb.sheetnames, ["芯片信息", "比特", "耦合器", "读取线", "可调 filter", "读取线连接", "耦合", "比特-耦合器连接", "接线", "参数历史"])
             self.assertEqual(wb["比特"].cell(2, frequency_col + 1).value, 5.0)
             self.assertIn(wb["比特"].cell(2, t1_col + 1).value, (None, ""))
             wb.close()

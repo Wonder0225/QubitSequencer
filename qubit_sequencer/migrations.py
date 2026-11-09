@@ -112,7 +112,61 @@ def _upgrade_3_to_4(db: sqlite3.Connection) -> None:
         db.execute("PRAGMA user_version=4")
 
 
-MIGRATIONS = {1: _upgrade_1_to_2, 2: _upgrade_2_to_3, 3: _upgrade_3_to_4}
+def _upgrade_4_to_5(db: sqlite3.Connection) -> None:
+    from .wiring_store import WIRING_STATEMENT
+    with db:
+        db.execute("BEGIN IMMEDIATE")
+        db.execute(WIRING_STATEMENT)
+        db.execute("PRAGMA user_version=5")
+
+
+def _upgrade_5_to_6(db: sqlite3.Connection) -> None:
+    from .storage import SCHEMA, PRESETS
+    from .readout_store import READOUT_STATEMENTS
+    # Rebuild the two CHECK constraints without rewriting child FK targets.
+    db.execute("PRAGMA foreign_keys=OFF")
+    try:
+        with db:
+            db.execute("BEGIN IMMEDIATE")
+            for table in ("devices", "parameter_definitions"):
+                statement = SCHEMA.split(f"CREATE TABLE {table} (", 1)[1].split(";", 1)[0]
+                db.execute(f"CREATE TABLE {table}_v6 (" + statement)
+                columns = ",".join(row[1] for row in db.execute(f"PRAGMA table_info({table})"))
+                db.execute(f"INSERT INTO {table}_v6 ({columns}) SELECT {columns} FROM {table}")
+                db.execute(f"DROP TABLE {table}")
+                db.execute(f"ALTER TABLE {table}_v6 RENAME TO {table}")
+            for statement in READOUT_STATEMENTS:
+                db.execute(statement)
+            db.executemany("INSERT OR IGNORE INTO parameter_definitions VALUES (?,?,?,?,?,?,0)",
+                           [row for row in PRESETS if row[2] in ("readout", "filter")])
+            if db.execute("PRAGMA foreign_key_check").fetchone():
+                raise ValueError("器件格式升级失败：外键检查未通过")
+            db.execute("PRAGMA user_version=6")
+    finally:
+        db.execute("PRAGMA foreign_keys=ON")
+
+
+def _upgrade_6_to_7(db: sqlite3.Connection) -> None:
+    from .storage import SCHEMA
+    db.execute("PRAGMA foreign_keys=OFF")
+    try:
+        with db:
+            db.execute("BEGIN IMMEDIATE")
+            statement = SCHEMA.split("CREATE TABLE devices (", 1)[1].split(";", 1)[0]
+            db.execute("CREATE TABLE devices_v7 (" + statement)
+            columns = ",".join(row[1] for row in db.execute("PRAGMA table_info(devices)"))
+            db.execute(f"INSERT INTO devices_v7 ({columns}) SELECT {columns} FROM devices")
+            db.execute("DROP TABLE devices")
+            db.execute("ALTER TABLE devices_v7 RENAME TO devices")
+            if db.execute("PRAGMA foreign_key_check").fetchone():
+                raise ValueError("读取线格式升级失败：外键检查未通过")
+            db.execute("PRAGMA user_version=7")
+    finally:
+        db.execute("PRAGMA foreign_keys=ON")
+
+
+MIGRATIONS = {1: _upgrade_1_to_2, 2: _upgrade_2_to_3, 3: _upgrade_3_to_4,
+              4: _upgrade_4_to_5, 5: _upgrade_5_to_6, 6: _upgrade_6_to_7}
 
 
 def migrate(path: str | Path) -> Path | None:

@@ -8,6 +8,7 @@
 - 修复问题、添加功能、优化界面、更新文档或“继续完成”不视为编译授权。
 - 未获明确指令，不运行 PyInstaller 或发布构建脚本，不生成或替换 EXE、ZIP，不自动提升软件版本号。
 - 编译授权仅适用于当次指定工作，不自动延续到后续修改。GitHub 发布、推送等操作也须有用户授权。
+- 获得编译授权后，默认更新固定启动路径 `output/release/QubitSequencer/QubitSequencer.exe` 及 `output/release/Qubit Sequencer.lnk`，使开始菜单快捷方式始终指向最新编译版。除非用户明确要求隔离构建，不使用 `-SkipLocalPublish`。更新前将旧固定目录保留在 `output/release/previous/`，不清理历史构建或用户项目。
 
 ## 精简验证
 

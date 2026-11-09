@@ -11,6 +11,7 @@ from PySide6.QtSvg import QSvgRenderer
 
 # A shared 20-unit view box keeps stroke weight consistent at 16 and 20 px.
 _SHAPES = {
+    "energy": '<path d="M3 17V3 M3 17h14 M6 12h4 M6 7h4 M13 10h4 M13 5h4"/>',
     "new": '<path d="M5 2.5h7l3 3v12H5z M12 2.5v3h3 M7.5 10h5 M10 7.5v5"/>',
     "open": '<path d="M2.5 6V4.5h6l2 2h7v2 M2.5 8.5h15l-2.5 8h-13z"/>',
     "backup": '<path d="M3 8h14v9H3z M2.5 4h15v4h-15z M8 11h4"/>',
@@ -22,6 +23,8 @@ _SHAPES = {
     "select": '<path d="m4 2 12 8-6 1-3 6z M10 11l4 6"/>',
     "qubit": '<circle cx="10" cy="10" r="5.5"/><path d="M10 2v2.5 M10 15.5V18 M2 10h2.5 M15.5 10H18 M8 10h4 M10 8v4"/>',
     "coupler": '<circle cx="4.5" cy="10" r="2"/><circle cx="15.5" cy="10" r="2"/><path d="M6.5 10H8l1-3 2 6 1-3h1.5"/>',
+    "readout": '<path d="M2 12h16 M6 4v8 M14 4v8"/><circle cx="6" cy="3" r="1"/><circle cx="14" cy="3" r="1"/>',
+    "filter": '<rect x="5" y="4" width="10" height="12" rx="2"/><path d="M2 10h3 M15 10h3 M7 8h2l2 4h2"/>',
     "connect": '<path d="m7.5 12.5 5-5 M6 11l-2 2a3.5 3.5 0 0 0 5 5l3-3a3.5 3.5 0 0 0 0-5 M14 9l2-2a3.5 3.5 0 0 0-5-5L8 5a3.5 3.5 0 0 0 0 5"/>',
     "fit": '<path d="M7 3H3v4 M13 3h4v4 M3 13v4h4 M17 13v4h-4"/><rect x="7" y="7" width="6" height="6" rx=".5"/>',
     "chevron": '<path d="m7 4 6 6-6 6"/>',

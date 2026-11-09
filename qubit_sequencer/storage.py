@@ -8,6 +8,7 @@ from __future__ import annotations
 import hashlib
 import json
 import math
+import re
 import sqlite3
 from contextlib import closing
 from datetime import datetime, timedelta, timezone
@@ -16,8 +17,12 @@ from uuid import uuid4
 from .attachment_store import AttachmentStore, AttachmentInput, AttachmentChange, ATTACHMENT_SCHEMA
 from .design_store import DesignStore, DESIGN_SCHEMA
 from .undo import undoable
+from .device_types import DEVICE_PREFIXES, SUBTYPES
+from .readout_store import ReadoutStore, READOUT_SCHEMA, project_to_readout, readout_point
+from .wiring_store import WiringStore, WIRING_SCHEMA
+from .parameter_rules import CALIBRATION_PRESETS, PRIMARY_ORDER, record_value, validate_bias_z
 
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 7
 FORMAT_NAME = "qchip"
 BEIJING = timezone(timedelta(hours=8), "UTC+08:00")
 
@@ -51,13 +56,13 @@ def new_id() -> str:
 
 # key, label, owner scope, category, value type, canonical display unit
 PRESETS = [
+    ("readout.resonator_frequency", "读取腔频", "readout", "measured", "number", "GHz"),
+    ("filter.bias_z", "Z 偏置", "filter", "measured", "number", ""),
     ("qubit.f01", "比特频率 f_{10}", "qubit", "measured", "number", "GHz"),
     ("qubit.anharmonicity", "非谐", "qubit", "measured", "number", "MHz"),
     ("qubit.readout_frequency", "读取频率", "qubit", "measured", "number", "GHz"),
     ("qubit.readout_power", "读取功率", "qubit", "measured", "number", "dBm"),
     ("qubit.t1", "T_{1}", "qubit", "measured", "number", "µs"),
-    ("qubit.t2_star", "Ramsey T_{2}^{*}", "qubit", "measured", "number", "µs"),
-    ("qubit.t2_echo", "Echo T_{2}", "qubit", "measured", "number", "µs"),
     ("qubit.design_f01", "设计频率 f_{10}", "qubit", "design", "number", "GHz"),
     ("qubit.ej_over_h", "E_{J}/h", "qubit", "design", "number", "GHz"),
     ("qubit.ec_over_h", "E_{C}/h", "qubit", "design", "number", "GHz"),
@@ -80,7 +85,7 @@ PRESETS = [
     ("coupling.c_design", "设计耦合电容", "coupling", "design", "number", "fF"),
     ("link.g_qc", "比特-耦合器强度", "link", "measured", "number", "MHz"),
     ("link.c_design", "比特-耦合器设计电容", "link", "design", "number", "fF"),
-]
+] + CALIBRATION_PRESETS
 
 # Read old built-in labels through a projection. IDs, keys, values and customized
 # labels remain in the original file; no schema or historical-data rewrite.
@@ -98,17 +103,20 @@ LEGACY_LABELS = {
 _PRESET_LABELS = {row[0]: row[1] for row in PRESETS}
 _LABEL_CASE = "CASE " + " ".join(
     f"WHEN is_custom=0 AND key='{key}' AND label='{old}' THEN '{_PRESET_LABELS[key]}'"
-    for key, old in LEGACY_LABELS.items()
+    for key, old in (*LEGACY_LABELS.items(), ("qubit.t2_echo", "Echo T_{2}"))
 ) + " ELSE label END AS label"
 _DEFINITION_COLUMNS = f"key,{_LABEL_CASE},scope,category,value_type,unit,is_custom"
 
 SCHEMA = """
 CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
 CREATE TABLE devices (
- id TEXT PRIMARY KEY, kind TEXT NOT NULL CHECK(kind IN ('qubit','coupler')),
+ id TEXT PRIMARY KEY, kind TEXT NOT NULL CHECK(kind IN ('qubit','coupler','readout','filter')),
  subtype TEXT NOT NULL, label TEXT NOT NULL UNIQUE, role TEXT NOT NULL DEFAULT '',
  x REAL NOT NULL, y REAL NOT NULL, dx REAL NOT NULL DEFAULT 0, dy REAL NOT NULL DEFAULT 0,
- notes TEXT NOT NULL DEFAULT '', created_at TEXT NOT NULL
+ notes TEXT NOT NULL DEFAULT '', created_at TEXT NOT NULL,
+ readout_length REAL NOT NULL DEFAULT 2 CHECK(readout_length>0),
+ readout_direction TEXT NOT NULL DEFAULT 'horizontal' CHECK(readout_direction IN ('horizontal','vertical','angled')),
+ readout_angle REAL
 );
 CREATE TABLE couplings (
  id TEXT PRIMARY KEY, qubit_a TEXT NOT NULL REFERENCES devices(id) ON DELETE CASCADE,
@@ -139,7 +147,7 @@ CREATE TABLE wiring_assignments (
 );
 CREATE TABLE parameter_definitions (
  key TEXT PRIMARY KEY, label TEXT NOT NULL, scope TEXT NOT NULL
- CHECK(scope IN ('qubit','coupler','coupling','link')),
+ CHECK(scope IN ('qubit','coupler','readout','filter','coupling','link')),
  category TEXT NOT NULL CHECK(category IN ('measured','design','custom')),
  value_type TEXT NOT NULL CHECK(value_type IN ('number','text')),
  unit TEXT NOT NULL DEFAULT '', is_custom INTEGER NOT NULL DEFAULT 0
@@ -176,9 +184,11 @@ CREATE TABLE attachments (
 
 SCHEMA += ATTACHMENT_SCHEMA
 SCHEMA += DESIGN_SCHEMA
+SCHEMA += WIRING_SCHEMA
+SCHEMA += READOUT_SCHEMA
 
 
-class ChipStore(AttachmentStore, DesignStore):
+class ChipStore(AttachmentStore, DesignStore, WiringStore, ReadoutStore):
     def __init__(self, path: str | Path, connection: sqlite3.Connection):
         self.path = Path(path)
         self.db = connection
@@ -229,7 +239,22 @@ class ChipStore(AttachmentStore, DesignStore):
             row = db.execute("SELECT value FROM meta WHERE key='format'").fetchone()
             if row is None or row[0] != FORMAT_NAME:
                 raise ValueError("Not a .qchip database")
-            return cls(path, db)
+            store = cls(path, db)
+            keys = dict(db.execute("SELECT key,is_custom FROM parameter_definitions WHERE scope='qubit'"))
+            missing = [preset for preset in CALIBRATION_PRESETS if preset[0] not in keys]
+            legacy_t2 = keys.get("qubit.t2") == 0
+            if missing or legacy_t2:
+                with db:
+                    db.executemany("INSERT OR IGNORE INTO parameter_definitions VALUES (?,?,?,?,?,?,0)", missing)
+                    if legacy_t2:
+                        db.execute("""UPDATE parameter_records AS legacy SET is_current=0
+                            WHERE legacy.definition_key='qubit.t2' AND legacy.is_current=1
+                            AND EXISTS (SELECT 1 FROM parameter_records AS ramsey
+                                WHERE ramsey.definition_key='qubit.t2_star' AND ramsey.is_current=1
+                                AND ramsey.device_id=legacy.device_id AND ramsey.point=legacy.point)""")
+                        db.execute("UPDATE parameter_records SET definition_key='qubit.t2_star' WHERE definition_key='qubit.t2'")
+                        db.execute("DELETE FROM parameter_definitions WHERE key='qubit.t2'")
+            return store
         except Exception:
             db.close()
             raise
@@ -257,15 +282,32 @@ class ChipStore(AttachmentStore, DesignStore):
             self.db.execute("INSERT INTO meta(key,value) VALUES (?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
                             (key, value))
 
+    def _next_device_name(self, kind: str) -> tuple[int, str]:
+        prefix = DEVICE_PREFIXES[kind]
+        row = self.db.execute("SELECT value FROM meta WHERE key=?", (f"device_sequence.{kind}",)).fetchone()
+        previous = int(row[0]) if row else self.db.execute(
+            "SELECT COUNT(*) FROM devices WHERE kind=?", (kind,)).fetchone()[0]
+        number = previous + 1
+        while self.db.execute("SELECT 1 FROM devices WHERE label IN (?,?)",
+                              (f"{prefix}_{{{number}}}", f"{prefix}_{number}")).fetchone():
+            number += 1
+        return number, f"{prefix}_{{{number}}}"
+
+    def next_device_label(self, kind: str) -> str:
+        """Suggest the next name without consuming a number."""
+        return self._next_device_name(kind)[1]
+
     @undoable("添加器件")
-    def add_device(self, kind: str, subtype: str, label: str, x: float, y: float,
-                   role: str = "", notes: str = "") -> str:
-        if kind not in ("qubit", "coupler"):
-            raise ValueError("kind must be qubit or coupler")
-        if kind == "qubit" and subtype not in ("fixed_transmon", "tunable_transmon"):
-            raise ValueError("invalid qubit subtype")
-        if kind == "coupler" and subtype not in ("fixed_coupler", "tunable_coupler"):
-            raise ValueError("invalid coupler subtype")
+    def add_device(self, kind: str, subtype: str, label: str | None, x: float, y: float,
+                   role: str = "", notes: str = "", *, readout_id=None, readout_position=None,
+                   readout_endpoints=None) -> str:
+        if kind not in SUBTYPES:
+            raise ValueError("invalid device kind")
+        if subtype not in {value for _, value in SUBTYPES[kind]}:
+            raise ValueError("invalid device subtype")
+        number, default_label = self._next_device_name(kind)
+        auto_name = kind == "coupler" and label is None
+        label = default_label if label is None else label
         if not label.strip() or not all(math.isfinite(v) for v in (x, y)):
             raise ValueError("invalid label or position")
         if kind == "qubit" and self.db.execute(
@@ -273,22 +315,38 @@ class ChipStore(AttachmentStore, DesignStore):
         ).fetchone():
             raise ValueError("qubit position already occupied")
         ident = new_id()
+        geometry = None
+        if readout_endpoints is not None:
+            from .readout_store import readout_geometry
+            if kind != "readout":
+                raise ValueError("只有读取线可以设置起点和终点")
+            geometry = readout_geometry(*readout_endpoints)
         with self.db:
-            self.db.execute("INSERT INTO devices VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+            self.db.execute("INSERT INTO devices (id,kind,subtype,label,role,x,y,dx,dy,notes,created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
                             (ident, kind, subtype, label.strip(), role, x, y, 0, 0, notes, beijing_now()))
+            self.db.execute("INSERT INTO meta(key,value) VALUES (?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                            (f"device_sequence.{kind}", str(number)))
+            if auto_name:
+                self.db.execute("INSERT INTO meta(key,value) VALUES (?,?)", (f"coupler_auto_name.{ident}", "1"))
+            if geometry:
+                fields = ",".join(f"{key}=?" for key in geometry)
+                self.db.execute(f"UPDATE devices SET {fields} WHERE id=?", (*geometry.values(), ident))
+            if kind in ("qubit", "coupler"):
+                for readout in self.devices("readout"):
+                    self._move_readout_filters(readout["id"])
+            if readout_id is not None:
+                self.add_readout_link(readout_id, ident, position=readout_position)
         return ident
 
     @undoable("修改器件")
     def update_device(self, ident: str, **changes: object) -> None:
-        allowed = {"label", "subtype", "role", "x", "y", "dx", "dy", "notes"}
+        allowed = {"label", "subtype", "role", "x", "y", "dx", "dy", "notes", "readout_length", "readout_direction", "readout_angle"}
         if not changes or set(changes) - allowed:
             raise ValueError("invalid device fields")
         old = self.device(ident)
         subtype = changes.get("subtype", old["subtype"])
-        if old["kind"] == "qubit" and subtype not in ("fixed_transmon", "tunable_transmon"):
-            raise ValueError("invalid qubit subtype")
-        if old["kind"] == "coupler" and subtype not in ("fixed_coupler", "tunable_coupler"):
-            raise ValueError("invalid coupler subtype")
+        if subtype not in {value for _, value in SUBTYPES[old["kind"]]}:
+            raise ValueError("invalid device subtype")
         if "label" in changes and not str(changes["label"]).strip():
             raise ValueError("label cannot be empty")
         for field in ("x", "y", "dx", "dy"):
@@ -301,9 +359,41 @@ class ChipStore(AttachmentStore, DesignStore):
                 "SELECT 1 FROM devices WHERE kind='qubit' AND id!=? AND x=? AND y=?", (ident, x, y)
             ).fetchone():
                 raise ValueError("qubit position already occupied")
+        if "readout_length" in changes:
+            length = float(changes["readout_length"])
+            if old["kind"] != "readout" or not math.isfinite(length) or length <= 0:
+                raise ValueError("读取线长度必须为正数")
+        if "readout_direction" in changes:
+            if old["kind"] != "readout" or changes["readout_direction"] not in ("horizontal", "vertical", "angled"):
+                raise ValueError("无效的读取线方向")
+            if changes["readout_direction"] != "angled" and old["readout_angle"] is not None:
+                changes["readout_angle"] = 0 if changes["readout_direction"] == "horizontal" else 90
+            elif changes["readout_direction"] == "angled" and old["readout_angle"] is None and "readout_angle" not in changes:
+                changes["readout_angle"] = 90 if old["readout_direction"] == "vertical" else 0
+        if "readout_angle" in changes and (old["kind"] != "readout" or not math.isfinite(float(changes["readout_angle"]))):
+            raise ValueError("读取线角度必须为有限数值")
+        geometry = {"x", "y", "dx", "dy", "readout_length", "readout_direction", "readout_angle"}
+        attached = self.filter_readout(ident) if old["kind"] == "filter" and geometry.intersection(changes) else None
+        position = None
+        if attached:
+            x = float(changes.get("x", old["x"])) + float(changes.get("dx", old["dx"]))
+            y = float(changes.get("y", old["y"])) + float(changes.get("dy", old["dy"]))
+            position, (x, y) = project_to_readout(self.device(attached["readout_id"]), x, y, self.devices())
+            position = self._available_filter_position(self.device(attached["readout_id"]), position, ident)
+            x, y = readout_point(self.device(attached["readout_id"]), position, self.devices())
+            changes.update(x=x, y=y, dx=0, dy=0)
         sql = ", ".join(f"{key}=?" for key in changes)
         with self.db:
             self.db.execute(f"UPDATE devices SET {sql} WHERE id=?", (*changes.values(), ident))
+            if old["kind"] == "coupler" and "label" in changes and changes["label"] != old["label"]:
+                self.db.execute("DELETE FROM meta WHERE key=?", (f"coupler_auto_name.{ident}",))
+            if attached:
+                self.db.execute("UPDATE readout_links SET position=? WHERE id=?", (position, attached["id"]))
+            if old["kind"] == "readout" and geometry.intersection(changes):
+                self._move_readout_filters(ident)
+            elif old["kind"] in ("qubit", "coupler") and geometry.intersection(changes):
+                for readout in self.devices("readout"):
+                    self._move_readout_filters(readout["id"])
 
     def device(self, ident: str) -> sqlite3.Row:
         row = self.db.execute("SELECT * FROM devices WHERE id=?", (ident,)).fetchone()
@@ -318,8 +408,14 @@ class ChipStore(AttachmentStore, DesignStore):
 
     @undoable("删除器件")
     def delete_device(self, ident: str) -> None:
+        old = self.device(ident)
         with self.db:
             self.db.execute("DELETE FROM devices WHERE id=?", (ident,))
+            if old["kind"] == "coupler":
+                self.db.execute("DELETE FROM meta WHERE key=?", (f"coupler_auto_name.{ident}",))
+            if old["kind"] in ("qubit", "coupler"):
+                for readout in self.devices("readout"):
+                    self._move_readout_filters(readout["id"])
 
     @undoable("添加耦合关系")
     def add_coupling(self, q1: str, q2: str, mode: str = "direct",
@@ -349,7 +445,28 @@ class ChipStore(AttachmentStore, DesignStore):
             if coupler_id:
                 self._ensure_link(q1, coupler_id)
                 self._ensure_link(q2, coupler_id)
+                self._name_connected_coupler(coupler_id, q1, q2)
         return ident
+
+    def _name_connected_coupler(self, coupler_id: str, q1: str, q2: str) -> None:
+        if not self.db.execute("SELECT 1 FROM meta WHERE key=?", (f"coupler_auto_name.{coupler_id}",)).fetchone():
+            return
+
+        def qubit_index(ident: str) -> str:
+            label = self.device(ident)["label"]
+            match = re.fullmatch(r"q(?:_\{([^{}]+)\}|_([^{}]+)|([0-9]+))", label, re.IGNORECASE)
+            return (match[1] or match[2] or match[3]) if match else label
+
+        indices = sorted((qubit_index(q1), qubit_index(q2)),
+                         key=lambda value: (0, int(value), value) if value.isdecimal() else (1, value.casefold(), value))
+        separator = "" if all(len(index) == 1 and index.isalnum() for index in indices) else ","
+        pair = separator.join(indices)
+        label = f"c_{{{pair}}}"
+        suffix = 2
+        while self.db.execute("SELECT 1 FROM devices WHERE label=? AND id!=?", (label, coupler_id)).fetchone():
+            label = f"c_{{{pair},{suffix}}}"
+            suffix += 1
+        self.db.execute("UPDATE devices SET label=? WHERE id=?", (label, coupler_id))
 
     def _ensure_link(self, qubit_id: str, coupler_id: str) -> str:
         row = self.db.execute("SELECT id FROM links WHERE qubit_id=? AND coupler_id=?",
@@ -383,6 +500,7 @@ class ChipStore(AttachmentStore, DesignStore):
                 ).fetchone():
                     self.db.execute("INSERT INTO couplings VALUES (?,?,?,?,?,?,?)",
                                     (new_id(), a, b, "coupler", coupler_id, "", beijing_now()))
+                self._name_connected_coupler(coupler_id, a, b)
         return ident
 
     def link(self, ident: str) -> sqlite3.Row:
@@ -437,7 +555,7 @@ class ChipStore(AttachmentStore, DesignStore):
 
     @undoable("添加制冷机线路")
     def add_line(self, line_type: str, cryostat: str = "", port: str = "",
-                 channel: str = "", notes: str = "", devices: list[str] | None = None) -> str:
+                 channel: str = "", notes: str = "", devices: list[str] | None = None, *, details=None) -> str:
         if not line_type.strip():
             raise ValueError("line type required")
         ident = new_id()
@@ -446,6 +564,8 @@ class ChipStore(AttachmentStore, DesignStore):
                             (ident, line_type.strip(), cryostat, port, channel, notes))
             for device_id in devices or []:
                 self.db.execute("INSERT INTO wiring_assignments VALUES (?,?)", (ident, device_id))
+            if details is not None:
+                self._write_line_details(ident, details)
         return ident
 
     def lines(self) -> list[sqlite3.Row]:
@@ -459,7 +579,7 @@ class ChipStore(AttachmentStore, DesignStore):
 
     @undoable("修改制冷机线路")
     def update_line(self, line_id: str, line_type: str, cryostat: str = "", port: str = "",
-                    channel: str = "", notes: str = "") -> None:
+                    channel: str = "", notes: str = "", *, details=None) -> None:
         self.line(line_id)
         if not line_type.strip():
             raise ValueError("line type required")
@@ -468,6 +588,8 @@ class ChipStore(AttachmentStore, DesignStore):
                 "UPDATE wiring_lines SET line_type=?,cryostat=?,port=?,channel=?,notes=? WHERE id=?",
                 (line_type.strip(), cryostat, port, channel, notes, line_id),
             )
+            if details is not None:
+                self._write_line_details(line_id, details)
 
     def line_devices(self, line_id: str) -> list[str]:
         return [r[0] for r in self.db.execute(
@@ -492,7 +614,7 @@ class ChipStore(AttachmentStore, DesignStore):
     @undoable("添加自定义参数")
     def add_definition(self, key: str, label: str, scope: str, value_type: str = "number",
                        unit: str = "", category: str = "custom") -> None:
-        if scope not in ("qubit", "coupler", "coupling", "link") or value_type not in ("number", "text"):
+        if scope not in (*SUBTYPES, "coupling", "link") or value_type not in ("number", "text"):
             raise ValueError("invalid parameter definition")
         if category not in ("design", "measured", "custom") or not key.strip() or not label.strip():
             raise ValueError("invalid parameter definition")
@@ -505,9 +627,10 @@ class ChipStore(AttachmentStore, DesignStore):
     def definitions(self, scope: str | None = None) -> list[sqlite3.Row]:
         ordering = "ORDER BY CASE category WHEN 'measured' THEN 0 WHEN 'design' THEN 1 ELSE 2 END, key"
         if scope:
-            return self.db.execute(
+            rows = self.db.execute(
                 f"SELECT {_DEFINITION_COLUMNS} FROM parameter_definitions WHERE scope=? {ordering}", (scope,)
             ).fetchall()
+            return sorted(rows, key=lambda row: PRIMARY_ORDER.get(row["key"], len(PRIMARY_ORDER))) if scope == "qubit" else rows
         return self.db.execute(f"SELECT {_DEFINITION_COLUMNS} FROM parameter_definitions {ordering},scope").fetchall()
 
     def definition(self, key: str) -> sqlite3.Row:
@@ -551,6 +674,7 @@ class ChipStore(AttachmentStore, DesignStore):
                 text = str(value)
         if bias_value is not None and not math.isfinite(float(bias_value)):
             raise ValueError("bias must be finite")
+        validate_bias_z(definition, value, bias_value)
         timestamp = beijing_timestamp(observed_at) if observed_at is not None else beijing_now()
         ident = new_id()
         with self.db:
@@ -587,12 +711,11 @@ class ChipStore(AttachmentStore, DesignStore):
         return self.db.execute(query, args).fetchall()
 
     def current_values(self, point: str = "default") -> dict[tuple[str, str], object]:
-        values = {}
-        for row in self.records(current_only=True, point=point):
-            values[(row["device_id"] or row["coupling_id"] or row["link_id"], row["definition_key"])] = (
-                row["numeric_value"] if row["numeric_value"] is not None else row["text_value"]
-            )
-        return values
+        return {key: record_value(row) for key, row in self.current_records(point).items()}
+
+    def current_records(self, point: str = "default") -> dict[tuple[str, str], sqlite3.Row]:
+        return {(row["device_id"] or row["coupling_id"] or row["link_id"], row["definition_key"]): row
+                for row in self.records(current_only=True, point=point)}
 
     @undoable("添加标定记录")
     def add_calibration(self, owner_id: str, experiment_type: str, fit_result: dict,
@@ -644,6 +767,11 @@ class ChipStore(AttachmentStore, DesignStore):
         for link in self.links():
             if self.device(link["qubit_id"])["kind"] != "qubit" or self.device(link["coupler_id"])["kind"] != "coupler":
                 issues.append(f"Invalid qubit-coupler link: {link['id']}")
+        for link in self.readout_links():
+            kind = self.device(link["device_id"])["kind"]
+            if (self.device(link["readout_id"])["kind"] != "readout" or kind not in ("qubit", "filter")
+                    or (link["position"] is not None) != (kind == "filter")):
+                issues.append(f"Invalid readout link: {link['id']}")
         for blob in self.db.execute("SELECT sha256,byte_size,data FROM attachment_blobs"):
             if len(blob["data"]) != blob["byte_size"] or hashlib.sha256(blob["data"]).hexdigest() != blob["sha256"]:
                 issues.append(f"Attachment checksum mismatch: {blob['sha256']}")

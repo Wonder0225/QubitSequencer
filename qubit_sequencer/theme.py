@@ -12,7 +12,7 @@ UI_COLORS = {
         "window": "#F5F6F8", "panel": "#FFFFFF", "toolbar": "#F0F2F5",
         "text": "#20252E", "muted": "#606B78", "border": "#D7DDE5",
         "hover": "#EBEFF5", "selected": "#E8F0FF", "accent": "#2563EB",
-        "grid": "#E8ECF1", "alternate": "#F8F9FB",
+        "grid": "#C5CED9", "alternate": "#F8F9FB",
         "pressed": "#E1E7F0", "focus": "#2563EB", "selected_text": "#1D4ED8",
         "accent_hover": "#1D4ED8", "accent_pressed": "#1E40AF", "accent_text": "#FFFFFF",
         "disabled": "#EEF0F3", "disabled_text": "#9099A5", "disabled_border": "#E0E4EA",
@@ -24,7 +24,7 @@ UI_COLORS = {
         "window": "#15181E", "panel": "#1D222A", "toolbar": "#232A34",
         "text": "#E8EDF4", "muted": "#AAB5C3", "border": "#343D49",
         "hover": "#2C3542", "selected": "#273C5D", "accent": "#79A7FF",
-        "grid": "#2B333E", "alternate": "#202630",
+        "grid": "#4C596A", "alternate": "#202630",
         "pressed": "#354052", "focus": "#79A7FF", "selected_text": "#A9C8FF",
         "accent_hover": "#93B8FF", "accent_pressed": "#6597EF", "accent_text": "#10213D",
         "disabled": "#242A33", "disabled_text": "#697585", "disabled_border": "#303844",
@@ -255,6 +255,7 @@ def stylesheet(mode: str) -> str:
             background: {c['toolbar']}; color: {c['muted']}; padding: 6px 8px; border: 0;
             border-bottom: 1px solid {c['border']}; font-weight: 600; font-size: 13px;
         }}
+        QHeaderView::section:horizontal {{ border-right: 1px solid {c['grid']}; }}
         QTableCornerButton::section {{ background: {c['toolbar']}; border: 0; border-bottom: 1px solid {c['border']}; }}
         QGraphicsView {{ background: {c['panel']}; border: 1px solid {c['border']}; }}
         QSplitter::handle {{ background: {c['border']}; }}

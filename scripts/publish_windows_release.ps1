@@ -23,44 +23,6 @@ function Assert-ReleasePath([string]$Path) {
     return $absolute
 }
 
-function Remove-ReleaseArtifact([string]$Path) {
-    $target = Assert-ReleasePath $Path
-    if (-not (Test-Path -LiteralPath $target)) { return }
-    $rootItem = Get-Item -LiteralPath $target -Force
-    $items = @($rootItem)
-    if ($rootItem.PSIsContainer) {
-        $items += @(Get-ChildItem -LiteralPath $target -Recurse -Force)
-    }
-    foreach ($item in $items) {
-        if ($item.LinkType) { throw "Refusing to remove a linked release artifact: $($item.FullName)" }
-    }
-    foreach ($item in $items) {
-        if (-not $item.PSIsContainer -and $item.Name -like '*.qchip*') {
-            $chipHash = (Get-FileHash -LiteralPath $item.FullName -Algorithm SHA256).Hash
-            if ($item.Name -ne 'surface_d3_complete.qchip' -or $chipHash -ne $packagedExampleHash) {
-                $recoveryDirectory = Join-Path $projectRoot 'projects/recovered-from-releases'
-                New-Item -ItemType Directory -Path $recoveryDirectory -Force | Out-Null
-                $recovered = Join-Path $recoveryDirectory $item.Name
-                if (Test-Path -LiteralPath $recovered) {
-                    if ((Get-FileHash -LiteralPath $recovered -Algorithm SHA256).Hash -eq $chipHash) { continue }
-                    $suffix = [System.Guid]::NewGuid().ToString('N').Substring(0, 8)
-                    $recovered = Join-Path $recoveryDirectory "$($item.BaseName)-$suffix$($item.Extension)"
-                }
-                Copy-Item -LiteralPath $item.FullName -Destination $recovered
-                if ((Get-FileHash -LiteralPath $recovered -Algorithm SHA256).Hash -ne $chipHash) {
-                    throw "Chip project backup verification failed: $recovered"
-                }
-                Write-Host "Preserved chip data: $recovered"
-            }
-        }
-        # OneDrive marks directories read-only; clear that flag before removal.
-        if ($item.Attributes -band [System.IO.FileAttributes]::ReadOnly) {
-            $item.Attributes = $item.Attributes -band (-bnot [System.IO.FileAttributes]::ReadOnly)
-        }
-    }
-    Remove-Item -LiteralPath $target -Recurse -Force
-}
-
 $source = Assert-ReleasePath $SourceDirectory
 $archive = Assert-ReleasePath $ArchivePath
 $published = Assert-ReleasePath (Join-Path $releaseRoot 'QubitSequencer')
@@ -100,20 +62,41 @@ try {
 }
 $exeHash = (Get-FileHash -LiteralPath (Join-Path $source 'QubitSequencer.exe') -Algorithm SHA256).Hash
 if ($archiveHash -ne $exeHash) { throw 'Release ZIP and executable do not match' }
-$packagedExampleHash = (Get-FileHash -LiteralPath (Join-Path $source 'examples/surface_d3_complete.qchip') -Algorithm SHA256).Hash
+$publishId = (Get-Date -Format 'yyyyMMdd-HHmmss') + '-' + [System.Guid]::NewGuid().ToString('N').Substring(0, 8)
+$previousRoot = Assert-ReleasePath (Join-Path $releaseRoot "previous/$publishId")
 
 if ($source -ne $published) {
     if ($published.StartsWith($source.TrimEnd('\') + '\', [System.StringComparison]::OrdinalIgnoreCase) -or
         $source.StartsWith($published.TrimEnd('\') + '\', [System.StringComparison]::OrdinalIgnoreCase)) {
         throw 'Source and destination directories cannot contain one another'
     }
-    Remove-ReleaseArtifact $published
-    Move-Item -LiteralPath $source -Destination $published
+    $previous = Assert-ReleasePath (Join-Path $previousRoot 'QubitSequencer')
+    if (Test-Path -LiteralPath $published) {
+        New-Item -ItemType Directory -Path $previousRoot -Force | Out-Null
+        Copy-Item -LiteralPath $published -Destination $previous -Recurse
+    }
+    # Keep the directory itself fixed; OneDrive can prevent renaming it.
+    New-Item -ItemType Directory -Path $published -Force | Out-Null
+    foreach ($item in Get-ChildItem -LiteralPath $source -Force) {
+        Copy-Item -LiteralPath $item.FullName -Destination $published -Recurse -Force
+    }
 }
 if ($archive -ne $publishedArchive) {
-    Remove-ReleaseArtifact $publishedArchive
-    Move-Item -LiteralPath $archive -Destination $publishedArchive
+    if (Test-Path -LiteralPath $publishedArchive) {
+        New-Item -ItemType Directory -Path $previousRoot -Force | Out-Null
+        Copy-Item -LiteralPath $publishedArchive -Destination $previousRoot
+    }
+    Copy-Item -LiteralPath $archive -Destination $publishedArchive -Force
 }
+
+$shortcutPath = Join-Path $releaseRoot 'Qubit Sequencer.lnk'
+$shell = New-Object -ComObject WScript.Shell
+$shortcut = $shell.CreateShortcut($shortcutPath)
+$shortcut.TargetPath = Join-Path $published 'QubitSequencer.exe'
+$shortcut.WorkingDirectory = $published
+$shortcut.IconLocation = "$published\QubitSequencer.exe,0"
+$shortcut.Description = 'Qubit Sequencer 最新本地编译版'
+$shortcut.Save()
 
 @(
     "Version: $Version",
@@ -127,12 +110,6 @@ if ($archive -ne $publishedArchive) {
     "$((Get-FileHash -LiteralPath (Join-Path $published 'user-guide.pdf') -Algorithm SHA256).Hash.ToLowerInvariant())  user-guide.pdf"
 ) | Set-Content -LiteralPath (Join-Path $releaseRoot 'SHA256SUMS.txt') -Encoding ascii
 
-# Only remove known generated release artifacts, preserving other project files.
-foreach ($item in @(Get-ChildItem -LiteralPath $releaseRoot -Force)) {
-    if ($item.PSIsContainer -and ($item.Name -eq 'builds' -or $item.Name -match '^\d+\.\d+\.\d+$')) {
-        Remove-ReleaseArtifact $item.FullName
-    } elseif (-not $item.PSIsContainer -and $item.Name -like 'QubitSequencer-*-win64*.zip' -and $item.FullName -ne $publishedArchive) {
-        Remove-ReleaseArtifact $item.FullName
-    }
-}
 Write-Host "Published $publishedArchive"
+Write-Host "Fixed EXE: $published\QubitSequencer.exe"
+Write-Host "Shortcut: $shortcutPath"

@@ -6,15 +6,17 @@ import hashlib
 import math
 from pathlib import Path
 
-from PySide6.QtCore import QPointF, QRectF, QSize, Qt, Signal, QVariantAnimation
+from PySide6.QtCore import QPoint, QPointF, QRectF, QSize, Qt, Signal, QVariantAnimation
 from PySide6.QtGui import (QBrush, QColor, QFont, QFontDatabase, QImage, QPainter,
-                           QPen, QPolygonF, QTextOption, QTransform)
+                           QPen, QPolygonF, QPainterPath, QPainterPathStroker, QTextOption, QTransform)
 from PySide6.QtSvg import QSvgGenerator
 from PySide6.QtWidgets import (QGraphicsEllipseItem, QGraphicsLineItem,
-                               QGraphicsPolygonItem, QGraphicsRectItem,
+                               QGraphicsPolygonItem, QGraphicsRectItem, QGraphicsPathItem,
                                QGraphicsScene, QGraphicsTextItem)
 
 from .storage import ChipStore
+from .device_types import DEVICE_COLORS, DEVICE_NAMES
+from .readout_store import readout_route, project_to_readout
 from .tex_labels import tex_to_html
 from .theme import DIAGRAM_COLORS
 
@@ -124,12 +126,22 @@ def cjk_font_family() -> str:
     return _FONT_FAMILY
 
 
+class ReadoutBusItem(QGraphicsPathItem):
+    def shape(self):
+        stroke = QPainterPathStroker(); stroke.setWidth(12)
+        return stroke.createStroke(self.path())
+
+    def boundingRect(self):
+        return self.path().boundingRect().adjusted(-6, -6, 6, 6)
+
+
 class ChipScene(QGraphicsScene):
     clicked = Signal(str, str)
     blank_clicked = Signal(float, float)
+    device_context_requested = Signal(str, QPoint)
 
     def __init__(self, store: ChipStore, field: str = "", point: str = "default",
-                 theme: str = "light"):
+                 theme: str = "light", *, readout_visible=True):
         super().__init__()
         self.store = store
         self.field = field
@@ -137,9 +149,15 @@ class ChipScene(QGraphicsScene):
         self.theme = theme if theme in DIAGRAM_COLORS else "light"
         self.colors = DIAGRAM_COLORS[self.theme]
         self.content_rect = QRectF()
+        self.readout_visible = readout_visible
+        self.deemphasize_couplers = readout_visible and bool(store.devices("readout"))
+        self._coupler_ids = {row["id"] for row in store.devices("coupler")}
+        self.last_click_scene_pos = None
         self.last_click_screen_pos = None
         self._device_items = {}
         self._animations = {}
+        self.readout_start = None
+        self.readout_end = None
         self._build()
 
     def logical_at(self, pos) -> tuple[float, float]:
@@ -180,20 +198,65 @@ class ChipScene(QGraphicsScene):
         self._press_pos = event.screenPos()
         super().mousePressEvent(event)
 
+    def set_readout_start(self, point):
+        self.readout_start = point
+        self.readout_end = point
+        self.update()
+
+    def mouseMoveEvent(self, event):
+        if self.readout_start is not None:
+            x, y = self.logical_at(event.scenePos())
+            self.readout_end = (round(x*2)/2, round(y*2)/2)
+            self.update()
+        super().mouseMoveEvent(event)
+
+    def drawForeground(self, painter, rect):
+        super().drawForeground(painter, rect)
+        if self.readout_start is None:
+            return
+        start = QPointF(PAD+self.readout_start[0]*CELL, PAD+self.readout_start[1]*CELL)
+        end = QPointF(PAD+self.readout_end[0]*CELL, PAD+self.readout_end[1]*CELL)
+        painter.save()
+        painter.setPen(QPen(QColor(DEVICE_COLORS["readout"]), 2, Qt.PenStyle.DashLine))
+        painter.drawLine(start, end)
+        painter.setPen(QPen(QColor(DEVICE_COLORS["readout"]), 2))
+        painter.setBrush(QColor(self.colors["paper"]))
+        for point in (start, end):
+            painter.drawEllipse(point, 5, 5)
+        painter.restore()
+
+    def _hit_item(self, position):
+        transform = self.views()[0].viewportTransform() if self.views() else QTransform()
+        for item in self.items(position, deviceTransform=transform):
+            while item is not None:
+                if item.data(0) or item.data(1) == "footer":
+                    return item
+                item = item.parentItem()
+        return None
+
+    def contextMenuEvent(self, event):
+        item = self._hit_item(event.scenePos())
+        target = item.data(0) if item is not None else None
+        if target and target[0] == "device":
+            event.accept()
+            self.device_context_requested.emit(target[1], event.screenPos())
+            return
+        super().contextMenuEvent(event)
+
     def mouseReleaseEvent(self, event):
-        if not hasattr(self, "_press_pos") or (event.screenPos() - self._press_pos).manhattanLength() > 4:
+        if (event.button() != Qt.MouseButton.LeftButton or not hasattr(self, "_press_pos")
+                or (event.screenPos() - self._press_pos).manhattanLength() > 4):
             super().mouseReleaseEvent(event)
             return
-        item = self.itemAt(event.scenePos(), self.views()[0].transform() if self.views() else QTransform())
-        while item is not None and not item.data(0):
-            if item.data(1) == "footer":
-                super().mouseReleaseEvent(event)
-                return
-            item = item.parentItem()
+        item = self._hit_item(event.scenePos())
+        if item is not None and not item.data(0):
+            super().mouseReleaseEvent(event)
+            return
         if item is not None:
             kind, ident = item.data(0)
             self.last_click_screen_pos = event.screenPos()
-            if kind == "device":
+            self.last_click_scene_pos = event.scenePos()
+            if kind == "device" and self.store.device(ident)["kind"] != "readout":
                 self.animate_device(ident)
             self.clicked.emit(kind, ident)
         else:
@@ -262,6 +325,9 @@ class ChipScene(QGraphicsScene):
         item.setAcceptedMouseButtons(Qt.MouseButton.NoButton)
         if target:
             item.setData(0, target)
+            if self.deemphasize_couplers and (target[0] == "link" or
+                    target[0] == "device" and target[1] in self._coupler_ids):
+                item.setOpacity(.4)
         self.addItem(item)
         return item
 
@@ -284,6 +350,7 @@ class ChipScene(QGraphicsScene):
         background.setPen(QPen(Qt.PenStyle.NoPen))
         background.setZValue(3)
         background.setData(0, label.data(0))
+        background.setOpacity(label.opacity())
         background.setAcceptedMouseButtons(Qt.MouseButton.NoButton)
         self.addItem(background)
         end = QPointF(min(max(anchor.x(), rect.left()), rect.right()),
@@ -294,6 +361,7 @@ class ChipScene(QGraphicsScene):
             start = anchor + delta * (radius / distance)
             leader = QGraphicsLineItem(start.x(), start.y(), end.x(), end.y())
             leader.setPen(QPen(QColor(self.colors["muted"]), 0.7))
+            leader.setOpacity(label.opacity())
             leader.setZValue(0)
             leader.setAcceptedMouseButtons(Qt.MouseButton.NoButton)
             self.addItem(leader)
@@ -370,11 +438,13 @@ class ChipScene(QGraphicsScene):
         DIRECT = self.colors["direct"]
         MISSING = self.colors["missing"]
         PALETTE = self.colors["categories"]
-        devices = self.store.devices()
+        devices = [device for device in self.store.devices()
+                   if self.readout_visible or device["kind"] not in ("readout", "filter")]
         couplings = self.store.couplings()
         links = self.store.links()
         meta = self.store.meta()
         by_id = {d["id"]: d for d in devices}
+        readout_routes = {d["id"]: readout_route(d, devices) for d in devices if d["kind"] == "readout"}
         xs = [float(d["x"] + d["dx"]) for d in devices]
         ys = [float(d["y"] + d["dy"]) for d in devices]
         if not devices and meta.get("template") in ("custom", "square"):
@@ -404,7 +474,7 @@ class ChipScene(QGraphicsScene):
         values = self.store.current_values(self.point)
         raw: dict[str, object] = {}
         if definition:
-            if definition["scope"] in ("qubit", "coupler"):
+            if definition["scope"] in DEVICE_NAMES:
                 raw = {d["id"]: values.get((d["id"], self.field))
                        for d in devices if d["kind"] == definition["scope"]}
             elif definition["scope"] == "coupling":
@@ -480,10 +550,24 @@ class ChipScene(QGraphicsScene):
             line.setPen(QPen(edge, 5 if definition and definition["scope"] == "link" else 3.5,
                              Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap))
             line.setData(0, ("link", link["id"]))
+            if self.deemphasize_couplers:
+                line.setOpacity(.22)
             line.setZValue(-1)
             self.addItem(line)
             if definition and definition["scope"] == "link":
                 edge_parameters.append((fmt(raw.get(link["id"])), a, b, ("link", link["id"])))
+
+        if self.readout_visible:
+            for link in self.store.readout_links():
+                if link["position"] is not None:
+                    continue
+                readout, qubit = by_id[link["readout_id"]], by_id[link["device_id"]]
+                _, point = project_to_readout(readout, qubit["x"]+qubit["dx"], qubit["y"]+qubit["dy"], route=readout_routes[readout["id"]])
+                start, end = pos(qubit), (PAD+point[0]*CELL, PAD+point[1]*CELL)
+                branch = QGraphicsLineItem(*start, *end)
+                branch.setPen(QPen(QColor(DEVICE_COLORS["readout"]), 1.8, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap))
+                branch.setData(0, ("readout_link", link["id"])); branch.setZValue(-.7)
+                self.addItem(branch)
 
         linked_qubits: dict[str, list] = {}
         for link in links:
@@ -491,6 +575,8 @@ class ChipScene(QGraphicsScene):
         centers = {d["id"]: QPointF(*pos(d)) for d in devices}
         bins = {}
         for ident, center in centers.items():
+            if by_id[ident]["kind"] == "readout":
+                continue
             key = math.floor(center.x() / CELL), math.floor(center.y() / CELL)
             bins.setdefault(key, []).append(ident)
         obstacles = _LabelObstacles()
@@ -512,7 +598,7 @@ class ChipScene(QGraphicsScene):
             ident = device["id"]
             center = centers[ident]
             radius = desired_radii[ident]
-            if self.field:
+            if self.field and device["kind"] != "readout":
                 col, row = math.floor(center.x() / CELL), math.floor(center.y() / CELL)
                 # Divide limited space in proportion to each glyph's requested
                 # size, so a multiline qubit can be bigger than its coupler.
@@ -523,33 +609,56 @@ class ChipScene(QGraphicsScene):
                              default=1)
                 radius = max(4, radius * min(1, factor))
             radii[ident] = radius
+            if device["kind"] == "readout":
+                continue
             obstacles.add(QRectF(center.x() - radius - 3, center.y() - radius - 3,
                                  2 * radius + 6, 2 * radius + 6))
         device_parameters = []
-        for device in devices:
+        for device in sorted(devices, key=lambda d: {"qubit":0,"coupler":1,"filter":2,"readout":3}[d["kind"]]):
             x, y = pos(device)
             is_qubit = device["kind"] == "qubit"
-            base = _qubit_role_color(device["role"], self.colors) if is_qubit else COUPLER
+            base = (_qubit_role_color(device["role"], self.colors) if is_qubit else
+                    COUPLER if device["kind"] == "coupler" else DEVICE_COLORS[device["kind"]])
             relevant = (definition is not None and definition["scope"] == device["kind"] or
                         self.field in ("device.subtype", "device.role") or self.field.startswith("wiring."))
             fill = color(raw.get(device["id"]), base) if relevant else QColor(base)
             radius = radii[device["id"]]
-            if is_qubit:
+            if device["kind"] == "readout":
+                path = QPainterPath()
+                ax, ay = readout_routes[device["id"]](0)
+                bx, by = readout_routes[device["id"]](1)
+                path.moveTo(PAD+ax*CELL, PAD+ay*CELL)
+                path.lineTo(PAD+bx*CELL, PAD+by*CELL)
+                item = ReadoutBusItem(path)
+            elif is_qubit:
                 item = QGraphicsEllipseItem(x-radius, y-radius, 2*radius, 2*radius)
-            else:
+            elif device["kind"] == "coupler":
                 item = QGraphicsPolygonItem(QPolygonF([QPointF(x, y-radius), QPointF(x+radius, y),
                                                        QPointF(x, y+radius), QPointF(x-radius, y)]))
-            item.setPen(QPen(QColor(INK), 1.8))
-            item.setBrush(QBrush(fill))
+            else:
+                path = QPainterPath()
+                half_height = radius / 3 if device["kind"] == "readout" else radius
+                path.addRoundedRect(QRectF(x-radius, y-half_height, 2*radius, 2*half_height), 3, 3)
+                item = QGraphicsPathItem(path)
+            if device["kind"] == "readout":
+                item.setPen(QPen(fill, 4, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap, Qt.PenJoinStyle.RoundJoin))
+                item.setBrush(QBrush(Qt.BrushStyle.NoBrush))
+            else:
+                item.setPen(QPen(QColor(INK), 1.8))
+                item.setBrush(QBrush(fill))
             item.setData(0, ("device", device["id"]))
-            item.setZValue(2)
+            item.setToolTip(f"{DEVICE_NAMES[device['kind']]} · {device['label']}")
+            item.setZValue(.5 if device["kind"] == "readout" else 2)
+            if device["kind"] == "coupler" and self.deemphasize_couplers:
+                item.setOpacity(.28)
             self.addItem(item)
             self._device_items[device["id"]] = item
             if self.field and relevant:
                 original = fmt(raw.get(device["id"]))
                 displayed = original
                 if self.field == "device.subtype":
-                    displayed = "可调" if "tunable" in original else "固定"
+                    displayed = ("读取线" if original == "readout_line" else
+                                 "可调" if "tunable" in original else "固定")
                 elif self.field == "device.role":
                     displayed = {"data": "D", "measure_x": "X", "measure_z": "Z"}.get(original, original)
                 elif self.field.startswith("wiring."):
@@ -563,7 +672,16 @@ class ChipScene(QGraphicsScene):
                 value_color = INK if fill.lightnessF() > 0.64 else "#FFFFFF"
                 label = self._parameter_text(displayed, ("device", device["id"]),
                                              tex=self.field == "device.role")
-                device_parameters.append((label, QPointF(x, y), radius, is_qubit, value_color))
+                if device["kind"] == "readout":
+                    ax, ay = readout_routes[device["id"]](.5)
+                    anchor = QPointF(PAD+ax*CELL, PAD+ay*CELL)
+                    bounds = label.boundingRect()
+                    candidates = [(anchor+QPointF(dx*(bounds.width()/2+12), dy*(bounds.height()/2+12)), anchor)
+                                  for dx, dy in ((0,1),(0,-1),(1,1),(-1,1),(1,-1),(-1,-1))]
+                    rect, _ = obstacles.place(bounds.width(), bounds.height(), candidates)
+                    self._callout(label, rect, anchor, 3)
+                else:
+                    device_parameters.append((label, QPointF(x, y), radius, is_qubit, value_color))
                 label.setToolTip(f"{device['label']} · {original}")
             elif not self.field and is_qubit:
                 label_color = INK if fill.lightnessF() > 0.64 else "#FFFFFF"
@@ -573,6 +691,23 @@ class ChipScene(QGraphicsScene):
                 label.setScale(factor)
                 label.setPos(x - label.boundingRect().width()*factor/2,
                              y - label.boundingRect().height()*factor/2)
+            elif not self.field and device["kind"] == "filter":
+                anchor = QPointF(x, y)
+                label = self._parameter_text(device["label"], ("device", device["id"]), tex=True)
+                bounds = label.boundingRect()
+                candidates = [(anchor+QPointF(dx*(radius+bounds.width()/2+8), dy*(radius+bounds.height()/2+8)), anchor)
+                              for dx, dy in ((0,1),(0,-1),(1,0),(-1,0),(1,1),(-1,1),(1,-1),(-1,-1))]
+                rect, _ = obstacles.place(bounds.width(), bounds.height(), candidates)
+                self._callout(label, rect, anchor, radius)
+            elif not self.field and device["kind"] == "readout":
+                end_x, end_y = readout_routes[device["id"]](1)
+                anchor = QPointF(PAD+end_x*CELL, PAD+end_y*CELL)
+                label = self._parameter_text(device["label"], ("device", device["id"]), tex=True)
+                bounds = label.boundingRect()
+                candidates = [(anchor+QPointF(dx*(bounds.width()/2+10), dy*(bounds.height()/2+12)), anchor)
+                              for dx, dy in ((1,-1),(-1,-1),(1,1),(-1,1))]
+                rect, _ = obstacles.place(bounds.width(), bounds.height(), candidates)
+                self._callout(label, rect, anchor, 3)
             elif not self.field:
                 neighbors = linked_qubits.get(device["id"], [])
                 horizontal = len(neighbors) == 2 and abs(neighbors[0]["y"] - neighbors[1]["y"]) < 0.01
@@ -583,8 +718,10 @@ class ChipScene(QGraphicsScene):
                     label.setScale(factor)
                     label.setPos(x - label.boundingRect().width()*factor/2, y + 13)
                 else:
-                    self._text(device["label"], x + 13, y - 11, 8, INK, False,
-                               ("device", device["id"]), tex=True)
+                    label_x = x + 13 if device["kind"] == "coupler" else x + radius + 5
+                    label = self._text(device["label"], label_x, y - 11, 8, INK, False,
+                                       ("device", device["id"]), tex=True)
+                obstacles.add(label.sceneBoundingRect().adjusted(-3,-3,3,3))
         def crowding(center):
             col, row = math.floor(center.x() / CELL), math.floor(center.y() / CELL)
             return sum(math.hypot(center.x() - centers[other].x(), center.y() - centers[other].y()) < 1.5 * CELL
@@ -622,6 +759,9 @@ class ChipScene(QGraphicsScene):
             legend.append((f"● {role_labels.get(role, role)}", _qubit_role_color(role, self.colors)))
         if any(d["kind"] == "coupler" for d in devices):
             legend.append(("◆ 耦合器", COUPLER))
+        for kind, symbol in (("readout", "━"), ("filter", "■")):
+            if any(d["kind"] == kind for d in devices):
+                legend.append((f"{symbol} {DEVICE_NAMES[kind]}", DEVICE_COLORS[kind]))
         if any(c["mode"] == "direct" for c in couplings):
             legend.append(("━━ 直接电容", DIRECT))
         if links:
@@ -630,6 +770,8 @@ class ChipScene(QGraphicsScene):
         self._legend_items = []
         for caption, swatch in legend:
             item = self._text(caption, 0, 0, 9, swatch, True, tex=True)
+            if self.deemphasize_couplers and swatch == COUPLER:
+                item.setOpacity(.4)
             item.setParentItem(self.footer_item)
             self._legend_items.append(item)
         self._parameter_items = []
@@ -655,7 +797,8 @@ class ChipScene(QGraphicsScene):
             elif categories:
                 category_labels = {
                     "device.subtype": {"fixed_transmon": "固定 Transmon", "tunable_transmon": "可调 Transmon",
-                                       "fixed_coupler": "固定耦合器", "tunable_coupler": "可调耦合器"},
+                                       "fixed_coupler": "固定耦合器", "tunable_coupler": "可调耦合器",
+                                       "readout_line": "读取线", "tunable_filter": "可调 filter"},
                     "coupling.mode": {"direct": "直接电容", "coupler": "经耦合器"},
                     "device.role": {"": "未指定", "data": "数据比特",
                                     "measure_x": "X 测量", "measure_z": "Z 测量"},
@@ -697,12 +840,12 @@ class ChipScene(QGraphicsScene):
 
 def export_diagram(store: ChipStore, path: str | Path, field: str = "",
                    point: str = "default", width: int = 1800,
-                   theme: str = "light") -> None:
+                   theme: str = "light", *, readout_visible=True) -> None:
     """Export a tight crop of the vector scene; the editor canvas remains unbounded."""
     path = Path(path)
     if width < 400 or width > 10000:
         raise ValueError("image width must be 400..10000")
-    scene = ChipScene(store, field, point, theme)
+    scene = ChipScene(store, field, point, theme, readout_visible=readout_visible)
     source = scene.content_rect
     height = max(400, round(width * source.height() / source.width()))
     if path.suffix.lower() == ".png":
