@@ -22,7 +22,7 @@ from .readout_store import ReadoutStore, READOUT_SCHEMA, project_to_readout, rea
 from .wiring_store import WiringStore, WIRING_SCHEMA
 from .parameter_rules import CALIBRATION_PRESETS, PRIMARY_ORDER, record_value, validate_bias_z
 
-SCHEMA_VERSION = 7
+SCHEMA_VERSION = 8
 FORMAT_NAME = "qchip"
 BEIJING = timezone(timedelta(hours=8), "UTC+08:00")
 
@@ -116,7 +116,8 @@ CREATE TABLE devices (
  notes TEXT NOT NULL DEFAULT '', created_at TEXT NOT NULL,
  readout_length REAL NOT NULL DEFAULT 2 CHECK(readout_length>0),
  readout_direction TEXT NOT NULL DEFAULT 'horizontal' CHECK(readout_direction IN ('horizontal','vertical','angled')),
- readout_angle REAL
+ readout_angle REAL,
+ drawing_number TEXT NOT NULL DEFAULT ''
 );
 CREATE TABLE couplings (
  id TEXT PRIMARY KEY, qubit_a TEXT NOT NULL REFERENCES devices(id) ON DELETE CASCADE,
@@ -340,7 +341,7 @@ class ChipStore(AttachmentStore, DesignStore, WiringStore, ReadoutStore):
 
     @undoable("修改器件")
     def update_device(self, ident: str, **changes: object) -> None:
-        allowed = {"label", "subtype", "role", "x", "y", "dx", "dy", "notes", "readout_length", "readout_direction", "readout_angle"}
+        allowed = {"label", "subtype", "role", "x", "y", "dx", "dy", "notes", "readout_length", "readout_direction", "readout_angle", "drawing_number"}
         if not changes or set(changes) - allowed:
             raise ValueError("invalid device fields")
         old = self.device(ident)

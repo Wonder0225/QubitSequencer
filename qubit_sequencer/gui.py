@@ -648,6 +648,7 @@ class MainWindow(QMainWindow, WorkbenchLayout):
             app.setWindowIcon(icon)
             self.setWindowIcon(icon)
         self.store: ChipStore | None = None
+        self.fridge_panel = None
         self.scene: ChipScene | None = None
         self._initial_fit_pending = False
         self.selected: tuple[str, str] | None = None
@@ -667,9 +668,11 @@ class MainWindow(QMainWindow, WorkbenchLayout):
         self.setWindowTitle("Qubit Sequencer 芯片登记")
         self.resize(1450, 900)
         self._build_ui()
+        from .fridge_store import FridgeStore
+        self._show_fridge(FridgeStore.preview(), activate=False, preview=True)
         self.cancel_placement_action = QAction(self)
         self.cancel_placement_action.setShortcut("Esc")
-        self.cancel_placement_action.triggered.connect(self._cancel_readout_placement)
+        self.cancel_placement_action.triggered.connect(self._cancel_current_placement)
         self.addAction(self.cancel_placement_action)
         self.view.setMouseTracking(True)
         geometry = self.settings.value("layout/geometry")
@@ -688,7 +691,10 @@ class MainWindow(QMainWindow, WorkbenchLayout):
         self.device_popup = DevicePopup(self)
         self.undo_controller = UndoController(self)
         if path:
-            self._open_path(path)
+            if Path(path).suffix.lower() == ".qfridge":
+                self._open_fridge_path(path)
+            else:
+                self._open_path(path)
 
     def set_theme(self, mode: str, persist: bool = True) -> None:
         self.theme = "dark" if mode == "dark" else "light"
@@ -722,6 +728,8 @@ class MainWindow(QMainWindow, WorkbenchLayout):
         if self.store:
             self.refresh_scene()
             self._refresh_energy_levels()
+        if self.fridge_panel:
+            self.fridge_panel.set_theme(self.theme)
 
     def _sync_mode(self, chosen: QAction, checked: bool):
         actions = (self.view_action, self.place_action, self.place_coupler_action,
@@ -775,10 +783,13 @@ class MainWindow(QMainWindow, WorkbenchLayout):
 
     def _update_undo_action(self):
         if hasattr(self, "undo_action"):
-            label = self.undo_history.label
+            panel = self._active_fridge_panel()
+            history = panel.history if panel else self.undo_history
+            available = not panel or (not panel.preview and not panel.is_overview())
+            label = history.label if available else ""
             self.undo_action.setText(f"撤回{label}" if label else "撤回")
             self.undo_action.setEnabled(bool(label))
-            label = self.undo_history.redo_label
+            label = history.redo_label if available else ""
             self.redo_action.setText(f"恢复{label}" if label else "恢复（重做）")
             self.redo_action.setEnabled(bool(label))
 
@@ -789,6 +800,10 @@ class MainWindow(QMainWindow, WorkbenchLayout):
         self._replay_edit(True)
 
     def _replay_edit(self, redo):
+        panel = self._active_fridge_panel()
+        if panel:
+            panel.redo() if redo else panel.undo()
+            return
         self._cancel_readout_placement()
         steps = self.undo_history.redo_steps if redo else self.undo_history.steps
         if not steps:
@@ -932,6 +947,68 @@ class MainWindow(QMainWindow, WorkbenchLayout):
         path, _ = QFileDialog.getOpenFileName(self, "打开芯片文件", "", "芯片文件 (*.qchip)")
         if path:
             self._open_path(path)
+
+    def new_fridge(self):
+        from .fridge_store import FridgeStore
+        name, ok = QInputDialog.getText(self, "新建制冷机项目", "制冷机名称")
+        if not ok or not name.strip():
+            return
+        path, _ = QFileDialog.getSaveFileName(self, "保存制冷机项目", f"{name}.qfridge", "制冷机项目 (*.qfridge)")
+        if not path:
+            return
+        if not path.lower().endswith(".qfridge"):
+            path += ".qfridge"
+        try:
+            use_preset = QMessageBox.question(self, "低温线路预设", "为这台制冷机应用内置低温线路预设？",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No, QMessageBox.StandardButton.No) == QMessageBox.StandardButton.Yes
+            self._show_fridge(FridgeStore.create(path, name.strip(), with_preset=use_preset))
+        except Exception as exc:
+            self._error("创建制冷机项目失败", exc)
+
+    def open_fridge(self):
+        path, _ = QFileDialog.getOpenFileName(self, "打开制冷机项目", "", "制冷机项目 (*.qfridge)")
+        if path:
+            self._open_fridge_path(path)
+
+    def _open_fridge_path(self, path):
+        from .fridge_store import FridgeStore
+        try:
+            self._show_fridge(FridgeStore.open(path))
+        except Exception as exc:
+            self._error("打开制冷机项目失败", exc)
+
+    def _show_fridge(self, store, *, activate=True, preview=False):
+        from .fridge_ui import FridgePanel
+        try:
+            panel = FridgePanel(store, self.fridge_workspace, host=self, preview=preview)
+        except Exception:
+            store.close()
+            raise
+        old = self.fridge_panel
+        self.fridge_panel = panel
+        self.fridge_workspace.addWidget(panel)
+        self.fridge_workspace.setCurrentWidget(panel)
+        if old:
+            self.fridge_workspace.removeWidget(old)
+            old.close(); old.deleteLater()
+        self.fridge_title.setText("默认盘位预览 · 请新建或打开项目" if preview else store.name())
+        self.fridge_title.setToolTip("" if preview else str(store.path))
+        if activate:
+            self.navigation.setCurrentRow(2)
+        self._update_undo_action()
+
+    def _active_fridge_panel(self):
+        if (self.fridge_panel and hasattr(self, "tabs") and self.tabs.currentIndex() == 2
+                and self.fridge_workspace.currentWidget() is self.fridge_panel):
+            return self.fridge_panel
+        return None
+
+    def _cancel_current_placement(self):
+        panel = self._active_fridge_panel()
+        if panel and panel.placing_port:
+            panel.cancel_placement()
+        else:
+            self._cancel_readout_placement()
 
     def _refresh_recent_menu(self):
         self.recent_menu.clear()
@@ -1193,13 +1270,17 @@ class MainWindow(QMainWindow, WorkbenchLayout):
         mediator = None
         try:
             kind_a, kind_b = self.store.device(first)["kind"], self.store.device(second)["kind"]
-            if "readout" in (kind_a, kind_b) and ({kind_a, kind_b} & {"qubit", "filter"}):
+            endpoints = {kind_a, kind_b}
+            readout_cavity = endpoints == {"readout", "qubit"}
+            if readout_cavity or endpoints == {"readout", "filter"}:
                 readout_id, device_id = (first, second) if kind_a == "readout" else (second, first)
                 link = self.store.add_readout_link(readout_id, device_id)
                 self.selected = ("readout_link", link)
-                self.refresh_content(); self._written("读取线关联")
+                self.refresh_content(); self._written("读取腔耦合" if readout_cavity else "读取线关联")
                 return
-            if {kind_a, kind_b} == {"qubit", "coupler"}:
+            if mode == "readout_cavity":
+                raise ValueError("读取腔耦合需要选择一个比特和一条读取线")
+            if endpoints == {"qubit", "coupler"}:
                 qid = first if kind_a == "qubit" else second
                 cid = first if kind_a == "coupler" else second
                 ident = self.store.add_link(qid, cid)
@@ -1250,7 +1331,8 @@ class MainWindow(QMainWindow, WorkbenchLayout):
                 a = self.store.device(obj["readout_id"])["label"]
                 b = self.store.device(obj["device_id"])["label"]
                 name = f"{a} — {b}"
-                self.selected_title.setText(f"<b>{tex_to_html(name)}</b><br>读取线关联")
+                caption = "读取腔耦合" if obj["position"] is None else "读取线关联"
+                self.selected_title.setText(f"<b>{tex_to_html(name)}</b><br>{caption}")
             elif kind == "coupling":
                 obj = self.store.coupling(ident)
                 scope = "coupling"
@@ -1805,6 +1887,9 @@ class MainWindow(QMainWindow, WorkbenchLayout):
         if not self._leave_file():
             event.ignore()
             return
+        if self.fridge_panel:
+            self.fridge_panel.close()
+            self.fridge_panel = None
         self.settings.setValue("layout/geometry", self.saveGeometry())
         self._remember_split()
         if hasattr(self, "device_popup"):

@@ -76,7 +76,7 @@ class DraftRegistry(QObject):
         store = self._store()
         if kind == "device":
             row = store.device(ident)
-            fields = DEVICE_FIELDS + (("readout_length", "readout_direction", "readout_angle") if row["kind"] == "readout" else ())
+            fields = DEVICE_FIELDS + (("drawing_number",) if row["kind"] == "qubit" else ()) + (("readout_length", "readout_direction", "readout_angle") if row["kind"] == "readout" else ())
             return row["kind"], {field: row[field] for field in fields}
         row = (store.coupling(ident) if kind == "coupling" else
                store.readout_link(ident) if kind == "readout_link" else store.link(ident))
@@ -254,6 +254,7 @@ class DeviceEditor(QWidget):
             positions.addWidget(axis)
             positions.addWidget(spin, 1)
         self.notes = QLineEdit()
+        self.drawing_number = QLineEdit()
         self.readout_length = QDoubleSpinBox()
         self.readout_length.setRange(.25, 1000); self.readout_length.setDecimals(2)
         self.readout_length.setSuffix(" 格")
@@ -268,6 +269,7 @@ class DeviceEditor(QWidget):
             field_label = QLabel(caption)
             field_label.setProperty("role", "muted")
             self.form.addRow(field_label, widget)
+        self.form.addRow("图纸编号", self.drawing_number)
         self.form.addRow("线长", self.readout_length)
         self.form.addRow("方向", self.readout_direction)
         self.form.addRow("角度", self.readout_angle)
@@ -281,6 +283,7 @@ class DeviceEditor(QWidget):
         layout.addWidget(self.error_label)
         self.label.textChanged.connect(lambda value: self._edit("label", value))
         self.notes.textChanged.connect(lambda value: self._edit("notes", value))
+        self.drawing_number.textChanged.connect(lambda value: self._edit("drawing_number", value))
         self.subtype.currentTextChanged.connect(lambda _text: self._edit("subtype", combo_value(self.subtype)))
         self.role.currentTextChanged.connect(lambda _text: self._edit("role", combo_value(self.role)))
         self.x.valueChanged.connect(lambda value: self._edit("x", value))
@@ -306,6 +309,7 @@ class DeviceEditor(QWidget):
         for widget in (self.label, self.subtype, self.role, self.coordinates):
             self.form.setRowVisible(widget, key[0] == "device")
         self.form.setRowVisible(self.role, scope in ("qubit", "coupler"))
+        self.form.setRowVisible(self.drawing_number, scope == "qubit")
         for widget in (self.readout_length, self.readout_direction, self.readout_angle):
             self.form.setRowVisible(widget, scope == "readout")
         self._sync(state)
@@ -316,6 +320,7 @@ class DeviceEditor(QWidget):
         self._scope = None
         _set_line(self.label, "")
         _set_line(self.notes, "")
+        _set_line(self.drawing_number, "")
         with _blocked(self.subtype):
             self.subtype.clear()
         _set_combo(self.role, "")
@@ -327,6 +332,7 @@ class DeviceEditor(QWidget):
         self.error_label.hide()
         for widget in (self.readout_length, self.readout_direction, self.readout_angle):
             self.form.setRowVisible(widget, False)
+        self.form.setRowVisible(self.drawing_number, False)
         self.setEnabled(False)
 
     def _edit(self, field: str, value: object) -> None:
@@ -347,6 +353,7 @@ class DeviceEditor(QWidget):
             _set_line(self.label, str(values["label"]))
             _set_combo(self.subtype, str(values["subtype"]))
             _set_combo(self.role, str(values["role"]))
+            _set_line(self.drawing_number, str(values.get("drawing_number", "")))
             if "readout_length" in values:
                 with _blocked(self.readout_length):
                     self.readout_length.setValue(values["readout_length"])

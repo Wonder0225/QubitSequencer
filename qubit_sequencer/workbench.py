@@ -78,6 +78,9 @@ class WorkbenchLayout:
                 file_menu.addSeparator()
             if key in ("xlsx", "csv", "image", "images"):
                 self.export_menu.addAction(action)
+        file_menu.addSeparator()
+        file_menu.addAction("新建制冷机项目…", self.new_fridge)
+        file_menu.addAction("打开制冷机项目…", self.open_fridge)
         edit_menu = self.menuBar().addMenu("编辑")
         self.undo_action = self._action("撤回", self.undo_edit, "undo", "Ctrl+Z")
         self.redo_action = self._action("恢复（重做）", self.redo_edit, "redo", "Ctrl+Y")
@@ -138,7 +141,7 @@ class WorkbenchLayout:
         self.navigation.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         self.navigation.setSpacing(4)
         for caption, symbol in (("芯片构型", "chip"), ("参数数据表", "table"),
-                                ("制冷机接线", "wiring"), ("参数历史", "history")):
+                                ("制冷机布线", "wiring"), ("参数历史", "history")):
             item = QListWidgetItem(caption); item.setSizeHint(QSize(144, 40))
             self.navigation.addItem(item); self._icon_bindings.append((item, symbol))
         body.addWidget(self.navigation)
@@ -194,8 +197,10 @@ class WorkbenchLayout:
         layer = QWidget(); layer_layout = QHBoxLayout(layer)
         layer_layout.setContentsMargins(0, 0, 0, 0); layer_layout.setSpacing(8)
         self.connection_mode = QComboBox(); self.connection_mode.addItem("直接电容", "direct")
-        self.connection_mode.addItem("经耦合器", "coupler"); self.connection_mode.setFixedWidth(112)
-        self.connection_mode.setToolTip("连接模式下，选择两比特之间的耦合方式")
+        self.connection_mode.addItem("经耦合器", "coupler")
+        self.connection_mode.addItem("读取腔耦合", "readout_cavity")
+        self.connection_mode.setFixedWidth(112)
+        self.connection_mode.setToolTip("直接电容或经耦合器用于连接两个比特；读取腔耦合用于连接比特与读取线")
         self.connection_mode.setEnabled(False); layer_layout.addWidget(self.connection_mode)
         self.field_combo = TexComboBox()
         self.field_combo.setSizeAdjustPolicy(QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon)
@@ -305,7 +310,26 @@ class WorkbenchLayout:
         self.tabs.addWidget(data_page)
         wiring_page = QWidget(); wiring_layout = QVBoxLayout(wiring_page)
         wiring_layout.setContentsMargins(16, 12, 16, 12); wiring_layout.setSpacing(12)
-        heading = QLabel("制冷机接线"); heading.setProperty("role", "heading"); wiring_layout.addWidget(heading)
+        fridge_row = QHBoxLayout()
+        heading = QLabel("制冷机布线"); heading.setProperty("role", "heading"); fridge_row.addWidget(heading)
+        self.fridge_title = QLabel("未打开制冷机项目"); self.fridge_title.setProperty("role", "muted")
+        self.fridge_title.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
+        fridge_row.addWidget(self.fridge_title, 1)
+        fridge_row.addWidget(self._tool_button("新建 .qfridge", self.new_fridge, "new"))
+        fridge_row.addWidget(self._tool_button("打开 .qfridge", self.open_fridge, "open"))
+        wiring_layout.addLayout(fridge_row)
+        self.fridge_workspace = QStackedWidget(); wiring_layout.addWidget(self.fridge_workspace, 1)
+        empty = QWidget(); empty_layout = QVBoxLayout(empty); empty_layout.addStretch()
+        empty_title = QLabel("新建或打开制冷机项目"); empty_title.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        empty_title.setProperty("role", "heading"); empty_layout.addWidget(empty_title)
+        empty_hint = QLabel("打开 .qfridge 后查看只读总览，选择盘号进入单盘并编辑接线。")
+        empty_hint.setAlignment(Qt.AlignmentFlag.AlignCenter); empty_hint.setWordWrap(True)
+        empty_hint.setProperty("role", "muted"); empty_layout.addWidget(empty_hint); empty_layout.addStretch()
+        self.fridge_workspace.addWidget(empty)
+        # Keep the old single-chip controls off screen for existing storage and
+        # migration code; the navigation page is the qfridge workspace.
+        self._legacy_wiring_page = QWidget(self); self._legacy_wiring_page.hide()
+        wiring_layout = QVBoxLayout(self._legacy_wiring_page)
         buttons = QHBoxLayout(); buttons.setSpacing(8); self.wiring_buttons = {}
         for text, callback in (("新增线路", self.add_line), ("编辑线路", self.edit_line),
                                ("关联器件", self.assign_line), ("解除关联", self.unassign_line), ("删除线路", self.delete_line)):
@@ -369,12 +393,15 @@ class WorkbenchLayout:
 
     def _page_changed(self, index):
         self.navigation.blockSignals(True); self.navigation.setCurrentRow(index); self.navigation.blockSignals(False)
+        if index == 2 and self.fridge_panel:
+            self.fridge_panel.refresh_filters(); self.fridge_panel.refresh()
         self.first_endpoint = None
         self.view_action.setChecked(True)
         self.design_panel.edit_button.setChecked(False)
         if hasattr(self, "device_popup"):
             self.device_popup.close()
         self._update_ui_state()
+        self._update_undo_action()
 
     def _show_chip_design(self, visible):
         self._show_chip_view(1 if visible else 0)

@@ -165,8 +165,16 @@ def _upgrade_6_to_7(db: sqlite3.Connection) -> None:
         db.execute("PRAGMA foreign_keys=ON")
 
 
+def _upgrade_7_to_8(db: sqlite3.Connection) -> None:
+    with db:
+        db.execute("BEGIN IMMEDIATE")
+        if "drawing_number" not in {row[1] for row in db.execute("PRAGMA table_info(devices)")}:
+            db.execute("ALTER TABLE devices ADD COLUMN drawing_number TEXT NOT NULL DEFAULT ''")
+        db.execute("PRAGMA user_version=8")
+
+
 MIGRATIONS = {1: _upgrade_1_to_2, 2: _upgrade_2_to_3, 3: _upgrade_3_to_4,
-              4: _upgrade_4_to_5, 5: _upgrade_5_to_6, 6: _upgrade_6_to_7}
+              4: _upgrade_4_to_5, 5: _upgrade_5_to_6, 6: _upgrade_6_to_7, 7: _upgrade_7_to_8}
 
 
 def migrate(path: str | Path) -> Path | None:

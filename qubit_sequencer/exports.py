@@ -38,7 +38,7 @@ def build_tables(store: ChipStore, point: str = "default",
     }
     for kind, title in (("qubit", "比特"), ("coupler", "耦合器"),
                         ("readout", "读取线"), ("filter", "可调 filter")):
-        extra_headers = (["线长 [格]", "方向", "起点 X", "起点 Y", "终点 X", "终点 Y"] if kind == "readout" else
+        extra_headers = (["图纸编号"] if kind == "qubit" else ["线长 [格]", "方向", "起点 X", "起点 Y", "终点 X", "终点 Y"] if kind == "readout" else
                          ["所属读取线", "线上相对位置"] if kind == "filter" else [])
         fields = []
         builtins = {d["key"] for d in defs[kind] if not d["is_custom"]}
@@ -53,7 +53,9 @@ def build_tables(store: ChipStore, point: str = "default",
         rows = []
         for device in store.devices(kind):
             extra = []
-            if kind == "readout":
+            if kind == "qubit":
+                extra = [device["drawing_number"]]
+            elif kind == "readout":
                 start, end = readout_endpoints(device)
                 extra = [device["readout_length"], device["readout_direction"], *start, *end]
             elif kind == "filter":

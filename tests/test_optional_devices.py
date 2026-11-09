@@ -67,7 +67,7 @@ def test_optional_device_roundtrip_export_and_delete_undo(tmp_path, kind, subtyp
 
 def test_v5_upgrade_preserves_existing_device_children(tmp_path):
     path = tmp_path / "v5.qchip"
-    schema_v5 = SCHEMA.replace(READOUT_SCHEMA, "").replace("'qubit','coupler','readout','filter'", "'qubit','coupler'")
+    schema_v5 = SCHEMA.replace(",\n drawing_number TEXT NOT NULL DEFAULT ''", "").replace(READOUT_SCHEMA, "").replace("'qubit','coupler','readout','filter'", "'qubit','coupler'")
     schema_v5 = re.sub(r",\n readout_length[^\n]*\n readout_direction[^\n]*\n readout_angle[^\n]*", "", schema_v5)
     with sqlite3.connect(path) as db:
         db.executescript(schema_v5)
@@ -227,9 +227,19 @@ def test_connect_shared_readout_place_filter_on_bus_and_hide(tmp_path):
     window = gui.MainWindow(str(path)); window.show()
     try:
         app.processEvents()
-        for q in qs:
-            window._connect(bus, q)
+        window.connect_action.setChecked(True)
+        mode = window.connection_mode
+        mode.setCurrentIndex(mode.findText("读取腔耦合"))
+        for first, second in ((bus, qs[0]), (qs[1], bus)):
+            window.on_scene_clicked("device", first)
+            window.on_scene_clicked("device", second)
         assert len(window.store.readout_links(bus)) == 2
+        assert "读取腔耦合" in window.selected_title.text()
+        with patch.object(window, "_error") as error:
+            window.on_scene_clicked("device", qs[0])
+            window.on_scene_clicked("device", qs[1])
+        assert "一个比特和一条读取线" in str(error.call_args.args[1])
+        assert len(window.store.couplings()) == 1
         assert window.scene._device_items[c].opacity() < window.scene._device_items[qs[0]].opacity()
         branches = [item for item in window.scene.items() if item.data(0) and item.data(0)[0] == "readout_link"]
         assert len(branches) == 2
@@ -349,7 +359,7 @@ def test_readout_endpoint_snapping_preview_cancel_history_and_reopen(tmp_path):
 
 def test_v6_upgrade_preserves_readout_geometry_and_children(tmp_path):
     path = tmp_path / "v6.qchip"
-    schema = SCHEMA.replace(",\n readout_angle REAL", "").replace("'horizontal','vertical','angled'", "'horizontal','vertical'")
+    schema = SCHEMA.replace(",\n drawing_number TEXT NOT NULL DEFAULT ''", "").replace(",\n readout_angle REAL", "").replace("'horizontal','vertical','angled'", "'horizontal','vertical'")
     with sqlite3.connect(path) as db:
         db.executescript(schema)
         db.executemany("INSERT INTO meta VALUES (?,?)", [("format", "qchip"), ("chip_name", "v6"),
@@ -360,7 +370,7 @@ def test_v6_upgrade_preserves_readout_geometry_and_children(tmp_path):
         db.execute("INSERT INTO readout_links VALUES ('RF','R','F',.5,'保留关联')")
         db.execute("PRAGMA user_version=6")
     with ChipStore.open(path) as store:
-        assert store.db.execute("PRAGMA user_version").fetchone()[0] == 7
+        assert store.db.execute("PRAGMA user_version").fetchone()[0] == 8
         assert store.validate() == []
         assert readout_endpoints(store.device("R")) == ((1, .5), (1, 3.5))
         assert store.device("R")["readout_angle"] is None

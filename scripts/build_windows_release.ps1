@@ -2,7 +2,7 @@ param([switch]$SkipLocalPublish)
 
 $ErrorActionPreference = 'Stop'
 $projectRoot = (Resolve-Path (Join-Path $PSScriptRoot '..')).Path
-$releaseVersion = '0.3.3'
+$releaseVersion = '0.4.1'
 $buildStamp = Get-Date -Format 'yyyyMMdd-HHmmss'
 $distPath = Join-Path $projectRoot "output/release/builds/$releaseVersion-$buildStamp"
 Set-Location -LiteralPath $projectRoot
@@ -35,6 +35,7 @@ $release = Join-Path $distPath 'QubitSequencer'
 $examples = Join-Path $release 'examples'
 New-Item -ItemType Directory -Path $examples -Force | Out-Null
 Copy-Item -LiteralPath 'examples/surface_d3_complete.qchip' -Destination $examples -Force
+Copy-Item -LiteralPath 'examples/fridge_wiring_demo.qfridge' -Destination $examples -Force
 Copy-Item -LiteralPath 'examples/chip_design_release_demo.qchip' -Destination $examples -Force
 Copy-Item -LiteralPath 'examples/chip_design_demo.md' -Destination $examples -Force
 Copy-Item -LiteralPath 'examples/surface_d3_complete_preview.png' -Destination $examples -Force
@@ -46,6 +47,9 @@ Copy-Item -LiteralPath 'examples/surface_d3_complete_dark_coupling_g_effective.p
 Copy-Item -LiteralPath 'docs/release-readme.md' -Destination (Join-Path $release 'README.md') -Force
 Copy-Item -LiteralPath 'docs/user-guide.md' -Destination $release -Force
 Copy-Item -LiteralPath 'docs/cryostat-wiring.md' -Destination $release -Force
+Copy-Item -LiteralPath 'docs/qfridge-format-v1.md' -Destination $release -Force
+Copy-Item -LiteralPath 'docs/qfridge-format-v2.md' -Destination $release -Force
+Copy-Item -LiteralPath 'docs/qchip-format-v8.md' -Destination $release -Force
 Copy-Item -LiteralPath 'docs/images' -Destination $release -Recurse -Force
 Copy-Item -LiteralPath 'output/pdf/user-guide.pdf' -Destination $release -Force
 Copy-Item -LiteralPath 'THIRD_PARTY_NOTICES.md' -Destination $release -Force
