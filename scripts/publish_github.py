@@ -102,6 +102,8 @@ def publish(client: GitHub, login: str, args: argparse.Namespace) -> None:
             "examples/square_lattice.qchip", "examples/surface_d3.qchip",
             "examples/surface_d3_complete.qchip",
             "examples/chip_design_release_demo.qchip",
+            "examples/fridge_wiring_demo_samples/sample_A.qchip",
+            "examples/fridge_wiring_demo_samples/sample_B.qchip",
         }:
             raise RuntimeError(f"Non-demo chip data is tracked: {name}")
 
@@ -116,6 +118,9 @@ def publish(client: GitHub, login: str, args: argparse.Namespace) -> None:
     with zipfile.ZipFile(archive) as bundle:
         names = {name.replace("\\", "/") for name in bundle.namelist()}
         for relative in ("QubitSequencer.exe", "THIRD_PARTY_NOTICES.md",
+                         "examples/fridge_wiring_demo.qfridge",
+                         "examples/fridge_wiring_demo_samples/sample_A.qchip",
+                         "examples/fridge_wiring_demo_samples/sample_B.qchip",
                          "licenses/third-party/Qt-LGPL-3.0.txt",
                          "licenses/third-party/PySide6-LGPL-3.0.txt"):
             if "QubitSequencer/" + relative not in names:

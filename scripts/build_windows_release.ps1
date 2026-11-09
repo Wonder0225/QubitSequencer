@@ -36,6 +36,9 @@ $examples = Join-Path $release 'examples'
 New-Item -ItemType Directory -Path $examples -Force | Out-Null
 Copy-Item -LiteralPath 'examples/surface_d3_complete.qchip' -Destination $examples -Force
 Copy-Item -LiteralPath 'examples/fridge_wiring_demo.qfridge' -Destination $examples -Force
+$fridgeSamples = Join-Path $examples 'fridge_wiring_demo_samples'
+New-Item -ItemType Directory -Path $fridgeSamples -Force | Out-Null
+Copy-Item -LiteralPath 'examples/fridge_wiring_demo_samples/sample_A.qchip', 'examples/fridge_wiring_demo_samples/sample_B.qchip' -Destination $fridgeSamples -Force
 Copy-Item -LiteralPath 'examples/chip_design_release_demo.qchip' -Destination $examples -Force
 Copy-Item -LiteralPath 'examples/chip_design_demo.md' -Destination $examples -Force
 Copy-Item -LiteralPath 'examples/surface_d3_complete_preview.png' -Destination $examples -Force
