@@ -47,7 +47,7 @@ class DesignStore:
 
     def design_markers(self):
         return self.db.execute(
-            """SELECT m.device_id,m.x,m.y,d.label,d.kind FROM design_markers m
+            """SELECT m.device_id,m.x,m.y,d.label,d.kind,d.subtype FROM design_markers m
                JOIN devices d ON d.id=m.device_id ORDER BY d.label"""
         ).fetchall()
 

@@ -1,6 +1,6 @@
 [project]
 name = "qubit-sequencer"
-version = "0.4.1"
+version = "0.4.3"
 description = "Local superconducting quantum chip registry"
 readme = "README.md"
 license = "MIT"
@@ -21,4 +21,4 @@ build-backend = "setuptools.build_meta"
 include = ["qubit_sequencer*"]
 
 [tool.setuptools.package-data]
-qubit_sequencer = ["assets/*.png", "assets/*.ico", "assets/*.svg"]
+qubit_sequencer = ["assets/*.png", "assets/*.ico", "assets/*.svg", "assets/sample_box_templates/*.json"]

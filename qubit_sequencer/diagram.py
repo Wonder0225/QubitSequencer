@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+from html import escape
 import math
 from pathlib import Path
 
@@ -12,13 +13,13 @@ from PySide6.QtGui import (QBrush, QColor, QFont, QFontDatabase, QImage, QPainte
 from PySide6.QtSvg import QSvgGenerator
 from PySide6.QtWidgets import (QGraphicsEllipseItem, QGraphicsLineItem,
                                QGraphicsPolygonItem, QGraphicsRectItem, QGraphicsPathItem,
-                               QGraphicsScene, QGraphicsTextItem)
+                               QGraphicsScene, QGraphicsTextItem, QGraphicsItem)
 
 from .storage import ChipStore
 from .device_types import DEVICE_COLORS, DEVICE_NAMES
 from .readout_store import readout_route, project_to_readout
 from .tex_labels import tex_to_html
-from .theme import DIAGRAM_COLORS
+from .theme import DIAGRAM_COLORS, custom_device_colors
 
 CELL = 92
 PAD = 90
@@ -440,6 +441,11 @@ class ChipScene(QGraphicsScene):
         PALETTE = self.colors["categories"]
         devices = [device for device in self.store.devices()
                    if self.readout_visible or device["kind"] not in ("readout", "filter")]
+        custom_names = {}
+        for device in devices:
+            if device["kind"] == "custom":
+                custom_names.setdefault(device["subtype"], []).append(device["label"])
+        custom_colors = custom_device_colors(custom_names)
         couplings = self.store.couplings()
         links = self.store.links()
         meta = self.store.meta()
@@ -614,14 +620,18 @@ class ChipScene(QGraphicsScene):
             obstacles.add(QRectF(center.x() - radius - 3, center.y() - radius - 3,
                                  2 * radius + 6, 2 * radius + 6))
         device_parameters = []
-        for device in sorted(devices, key=lambda d: {"qubit":0,"coupler":1,"filter":2,"readout":3}[d["kind"]]):
+        draw_order = {"qubit": 0, "coupler": 1, "filter": 2, "custom": 3, "readout": 4}
+        for device in sorted(devices, key=lambda d: draw_order[d["kind"]]):
             x, y = pos(device)
             is_qubit = device["kind"] == "qubit"
+            is_custom = device["kind"] == "custom"
             base = (_qubit_role_color(device["role"], self.colors) if is_qubit else
-                    COUPLER if device["kind"] == "coupler" else DEVICE_COLORS[device["kind"]])
+                    COUPLER if device["kind"] == "coupler" else
+                    custom_colors[device["subtype"]] if is_custom else DEVICE_COLORS[device["kind"]])
             relevant = (definition is not None and definition["scope"] == device["kind"] or
                         self.field in ("device.subtype", "device.role") or self.field.startswith("wiring."))
-            fill = color(raw.get(device["id"]), base) if relevant else QColor(base)
+            fill = (color(raw.get(device["id"]), base)
+                    if relevant and not (is_custom and self.field == "device.subtype") else QColor(base))
             radius = radii[device["id"]]
             if device["kind"] == "readout":
                 path = QPainterPath()
@@ -635,10 +645,12 @@ class ChipScene(QGraphicsScene):
             elif device["kind"] == "coupler":
                 item = QGraphicsPolygonItem(QPolygonF([QPointF(x, y-radius), QPointF(x+radius, y),
                                                        QPointF(x, y+radius), QPointF(x-radius, y)]))
+            elif is_custom:
+                vertices = ((-.5, -.85), (.5, -.85), (1, 0), (.5, .85), (-.5, .85), (-1, 0))
+                item = QGraphicsPolygonItem(QPolygonF([QPointF(x+dx*radius, y+dy*radius) for dx, dy in vertices]))
             else:
                 path = QPainterPath()
-                half_height = radius / 3 if device["kind"] == "readout" else radius
-                path.addRoundedRect(QRectF(x-radius, y-half_height, 2*radius, 2*half_height), 3, 3)
+                path.addRoundedRect(QRectF(x-radius, y-radius, 2*radius, 2*radius), 3, 3)
                 item = QGraphicsPathItem(path)
             if device["kind"] == "readout":
                 item.setPen(QPen(fill, 4, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap, Qt.PenJoinStyle.RoundJoin))
@@ -647,7 +659,9 @@ class ChipScene(QGraphicsScene):
                 item.setPen(QPen(QColor(INK), 1.8))
                 item.setBrush(QBrush(fill))
             item.setData(0, ("device", device["id"]))
-            item.setToolTip(f"{DEVICE_NAMES[device['kind']]} · {device['label']}")
+            item.setFlag(QGraphicsItem.GraphicsItemFlag.ItemIsSelectable)
+            caption = device["subtype"] if is_custom else DEVICE_NAMES[device["kind"]]
+            item.setToolTip(f"{caption} · {device['label']}")
             item.setZValue(.5 if device["kind"] == "readout" else 2)
             if device["kind"] == "coupler" and self.deemphasize_couplers:
                 item.setOpacity(.28)
@@ -656,7 +670,7 @@ class ChipScene(QGraphicsScene):
             if self.field and relevant:
                 original = fmt(raw.get(device["id"]))
                 displayed = original
-                if self.field == "device.subtype":
+                if self.field == "device.subtype" and not is_custom:
                     displayed = ("读取线" if original == "readout_line" else
                                  "可调" if "tunable" in original else "固定")
                 elif self.field == "device.role":
@@ -695,8 +709,8 @@ class ChipScene(QGraphicsScene):
                 anchor = QPointF(x, y)
                 label = self._parameter_text(device["label"], ("device", device["id"]), tex=True)
                 bounds = label.boundingRect()
-                candidates = [(anchor+QPointF(dx*(radius+bounds.width()/2+8), dy*(radius+bounds.height()/2+8)), anchor)
-                              for dx, dy in ((0,1),(0,-1),(1,0),(-1,0),(1,1),(-1,1),(1,-1),(-1,-1))]
+                candidates = ((anchor + QPointF(dx*(radius+bounds.width()/2+8), dy*(radius+bounds.height()/2+8)), anchor)
+                              for dx, dy in ((0,1),(0,-1),(1,0),(-1,0),(1,1),(-1,1),(1,-1),(-1,-1)))
                 rect, _ = obstacles.place(bounds.width(), bounds.height(), candidates)
                 self._callout(label, rect, anchor, radius)
             elif not self.field and device["kind"] == "readout":
@@ -708,7 +722,7 @@ class ChipScene(QGraphicsScene):
                               for dx, dy in ((1,-1),(-1,-1),(1,1),(-1,1))]
                 rect, _ = obstacles.place(bounds.width(), bounds.height(), candidates)
                 self._callout(label, rect, anchor, 3)
-            elif not self.field:
+            elif not self.field and not is_custom:
                 neighbors = linked_qubits.get(device["id"], [])
                 horizontal = len(neighbors) == 2 and abs(neighbors[0]["y"] - neighbors[1]["y"]) < 0.01
                 if horizontal:
@@ -762,6 +776,13 @@ class ChipScene(QGraphicsScene):
         for kind, symbol in (("readout", "━"), ("filter", "■")):
             if any(d["kind"] == kind for d in devices):
                 legend.append((f"{symbol} {DEVICE_NAMES[kind]}", DEVICE_COLORS[kind]))
+        custom_legend = {}
+        for subtype, swatch in custom_colors.items():
+            names = custom_names[subtype]
+            caption = f"⬢ {subtype} · {'、'.join(names)}"
+            names_html = "、".join(map(tex_to_html, names))
+            custom_legend[caption] = f'<span style="color:{swatch}">⬢</span> {escape(subtype)} · {names_html}'
+            legend.append((caption, swatch))
         if any(c["mode"] == "direct" for c in couplings):
             legend.append(("━━ 直接电容", DIRECT))
         if links:
@@ -769,9 +790,16 @@ class ChipScene(QGraphicsScene):
         self.legend_entries = legend
         self._legend_items = []
         for caption, swatch in legend:
-            item = self._text(caption, 0, 0, 9, swatch, True, tex=True)
-            if self.deemphasize_couplers and swatch == COUPLER:
-                item.setOpacity(.4)
+            if caption in custom_legend:
+                item = self._text(caption, 0, 0, 9, INK, True)
+                item.setHtml(custom_legend[caption])
+                max_width = max(410, self.body_rect.width())
+                if item.boundingRect().width() > max_width:
+                    item.setTextWidth(max_width)
+            else:
+                item = self._text(caption, 0, 0, 9, swatch, True, tex=True)
+                if self.deemphasize_couplers and swatch == COUPLER:
+                    item.setOpacity(.4)
             item.setParentItem(self.footer_item)
             self._legend_items.append(item)
         self._parameter_items = []

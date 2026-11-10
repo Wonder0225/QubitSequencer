@@ -21,7 +21,7 @@ import tempfile
 ROOT = Path(__file__).resolve().parents[1]
 SIZES = ((1450, 900), (960, 650))
 SCALES = (1, 1.5, 2)
-PAGES = ("chip", "parameters", "wiring", "history")
+PAGES = ("chip", "sample-box", "parameters", "wiring", "history")
 SIMULATION = "Qt缩放模拟；未修改或手工验证Windows系统DPI"
 SCREEN_CONFIG_SOURCE = "https://raw.githubusercontent.com/qt/qtbase/dev/src/plugins/platforms/offscreen/qoffscreenintegration.cpp"
 

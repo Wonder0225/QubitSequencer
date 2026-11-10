@@ -13,16 +13,18 @@ from PySide6.QtGui import QImage
 from PySide6.QtTest import QTest
 from PySide6.QtWidgets import QApplication
 
-from qubit_sequencer import gui
+from qubit_sequencer import gui, storage
 from qubit_sequencer.exports import build_tables, export_csv, export_xlsx
 from qubit_sequencer.storage import ChipStore, SCHEMA, SCHEMA_VERSION, PRESETS
 from qubit_sequencer.undo import EditHistory
 from qubit_sequencer.readout_store import READOUT_SCHEMA, readout_point, readout_endpoints
+from qubit_sequencer.sample_box_store import SAMPLE_BOX_SCHEMA
 from openpyxl import load_workbook
 
 
 @pytest.mark.parametrize("kind,subtype,title", [
-    ("readout", "readout_line", "读取线"), ("filter", "tunable_filter", "可调 filter")])
+    ("readout", "readout_line", "读取线"), ("filter", "tunable_filter", "可调 filter"),
+    ("custom", "测试电容", "自定义元件")])
 def test_optional_device_roundtrip_export_and_delete_undo(tmp_path, kind, subtype, title):
     path = tmp_path / "optional.qchip"
     with ChipStore.create(path, "测试芯片") as store:
@@ -58,16 +60,43 @@ def test_optional_device_roundtrip_export_and_delete_undo(tmp_path, kind, subtyp
             assert rows[0][headers.index("名称")] == "renamed"
             assert rows[0][-1] == 6.2
     with ChipStore.open(path) as store:
-        assert (tmp_path / ("readout_lines.csv" if kind == "readout" else "filters.csv")) in export_csv(store, tmp_path)
+        name = {"readout": "readout_lines", "filter": "filters", "custom": "custom_devices"}[kind]
+        assert (tmp_path / f"{name}.csv") in export_csv(store, tmp_path)
         export_xlsx(store, tmp_path / "optional.xlsx")
     workbook = load_workbook(tmp_path / "optional.xlsx")
     assert workbook[title].cell(2, 2).value == "renamed"
     workbook.close()
 
 
+SCHEMA_V9 = SCHEMA.replace("'filter','custom'", "'filter'")
+
+
+def test_v9_upgrade_preserves_sample_box_and_parameters(tmp_path, monkeypatch):
+    path = tmp_path / "sample.qchip"
+    with monkeypatch.context() as old_format:
+        old_format.setattr(storage, "SCHEMA", SCHEMA_V9)
+        old_format.setattr(storage, "SCHEMA_VERSION", 9)
+        with ChipStore.create(path, "旧芯片") as store:
+            qubit = store.add_device("qubit", "fixed_transmon", "q_{1}", 0, 0)
+            store.set_parameter(qubit, "qubit.f01", 5.1)
+            store.enable_sample_box()
+            port = store.sample_box_ports()[0]
+            store.save_sample_box_port(port["id"], port["number"], True, qubit)
+
+    with ChipStore.open(path) as store:
+        assert store.db.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_VERSION
+        assert store.sample_box_ports()[0]["device_id"] == qubit
+        assert store.current_values()[(qubit, "qubit.f01")] == 5.1
+        store.add_device("custom", "直通线", None, 1, 0)
+        assert store.validate() == []
+    with sqlite3.connect(tmp_path / "sample.pre-v9.qchip") as backup:
+        assert backup.execute("PRAGMA user_version").fetchone()[0] == 9
+        assert backup.execute("SELECT port_id,device_id FROM sample_box_bindings").fetchone() == (port["id"], qubit)
+
+
 def test_v5_upgrade_preserves_existing_device_children(tmp_path):
     path = tmp_path / "v5.qchip"
-    schema_v5 = SCHEMA.replace(",\n drawing_number TEXT NOT NULL DEFAULT ''", "").replace(READOUT_SCHEMA, "").replace("'qubit','coupler','readout','filter'", "'qubit','coupler'")
+    schema_v5 = SCHEMA_V9.replace(SAMPLE_BOX_SCHEMA, "").replace(",\n drawing_number TEXT NOT NULL DEFAULT ''", "").replace(READOUT_SCHEMA, "").replace("'qubit','coupler','readout','filter'", "'qubit','coupler'")
     schema_v5 = re.sub(r",\n readout_length[^\n]*\n readout_direction[^\n]*\n readout_angle[^\n]*", "", schema_v5)
     with sqlite3.connect(path) as db:
         db.executescript(schema_v5)
@@ -359,7 +388,7 @@ def test_readout_endpoint_snapping_preview_cancel_history_and_reopen(tmp_path):
 
 def test_v6_upgrade_preserves_readout_geometry_and_children(tmp_path):
     path = tmp_path / "v6.qchip"
-    schema = SCHEMA.replace(",\n drawing_number TEXT NOT NULL DEFAULT ''", "").replace(",\n readout_angle REAL", "").replace("'horizontal','vertical','angled'", "'horizontal','vertical'")
+    schema = SCHEMA_V9.replace(SAMPLE_BOX_SCHEMA, "").replace(",\n drawing_number TEXT NOT NULL DEFAULT ''", "").replace(",\n readout_angle REAL", "").replace("'horizontal','vertical','angled'", "'horizontal','vertical'")
     with sqlite3.connect(path) as db:
         db.executescript(schema)
         db.executemany("INSERT INTO meta VALUES (?,?)", [("format", "qchip"), ("chip_name", "v6"),
@@ -370,7 +399,7 @@ def test_v6_upgrade_preserves_readout_geometry_and_children(tmp_path):
         db.execute("INSERT INTO readout_links VALUES ('RF','R','F',.5,'保留关联')")
         db.execute("PRAGMA user_version=6")
     with ChipStore.open(path) as store:
-        assert store.db.execute("PRAGMA user_version").fetchone()[0] == 8
+        assert store.db.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_VERSION
         assert store.validate() == []
         assert readout_endpoints(store.device("R")) == ((1, .5), (1, 3.5))
         assert store.device("R")["readout_angle"] is None

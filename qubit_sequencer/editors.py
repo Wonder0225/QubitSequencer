@@ -14,7 +14,7 @@ from PySide6.QtWidgets import (
 )
 
 from .storage import ChipStore
-from .device_types import SUBTYPES
+from .device_types import DEVICE_NAMES, SUBTYPES
 from .undo import undoable
 
 
@@ -38,7 +38,7 @@ def combo_value(combo: QComboBox) -> str:
 
 
 def _key(kind: str, ident: str) -> tuple[str, str]:
-    if kind in SUBTYPES:
+    if kind in DEVICE_NAMES:
         kind = "device"
     if kind not in ("device", "coupling", "link", "readout_link"):
         raise ValueError(f"不支持的对象类型：{kind}")
@@ -229,6 +229,7 @@ class DeviceEditor(QWidget):
         self.label = QLineEdit()
         self.label.setPlaceholderText("支持 Q_{1}、\\omega_{01} 等标签")
         self.subtype = QComboBox()
+        self.subtype.setInsertPolicy(QComboBox.InsertPolicy.NoInsert)
         self.role = QComboBox()
         self.role.setEditable(True)
         self.role.setInsertPolicy(QComboBox.InsertPolicy.NoInsert)
@@ -303,6 +304,7 @@ class DeviceEditor(QWidget):
         if scope != self._scope:
             self._scope = scope
             with _blocked(self.subtype):
+                self.subtype.setEditable(scope == "custom")
                 self.subtype.clear()
                 for caption, value in SUBTYPES.get(scope, ()):
                     self.subtype.addItem(caption, value)

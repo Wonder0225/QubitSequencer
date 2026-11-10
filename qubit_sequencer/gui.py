@@ -20,6 +20,7 @@ from PySide6.QtWidgets import (
 )
 
 from .diagram import ChipScene, cjk_font_family, export_diagram
+from .graphics_interaction import RightPanMixin
 from .editors import DeviceEditor, DraftRegistry
 from .recent_files import RecentFiles, RecentFilesDialog
 from .attachment_ui import AttachmentPanel, AttachmentDialog, install_paste_shortcut
@@ -274,7 +275,7 @@ class TexComboBox(QComboBox):
         painter.end()
 
 
-class ChipView(QGraphicsView):
+class ChipView(RightPanMixin, QGraphicsView):
     def __init__(self):
         super().__init__()
         self.setRenderHint(QPainter.RenderHint.Antialiasing)
@@ -282,7 +283,7 @@ class ChipView(QGraphicsView):
         # The procedural grid and animated glyphs share the canvas with footer
         # annotations. Repaint it together rather than erasing sparse dirty regions.
         self.setViewportUpdateMode(QGraphicsView.ViewportUpdateMode.FullViewportUpdate)
-        self.setDragMode(QGraphicsView.DragMode.ScrollHandDrag)
+        self.setDragMode(QGraphicsView.DragMode.RubberBandDrag)
         self.setTransformationAnchor(QGraphicsView.ViewportAnchor.AnchorUnderMouse)
         self._fit_active = False
         self._fit_scheduled = False
@@ -474,6 +475,31 @@ class ParameterDialog(QDialog):
         super().reject()
 
 
+class CustomDeviceDialog(QDialog):
+    def __init__(self, label, types, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("放置自定义元件")
+        form = QFormLayout(self)
+        self.name = QLineEdit(label)
+        self.name.selectAll()
+        self.subtype = QComboBox()
+        self.subtype.setEditable(True)
+        self.subtype.setInsertPolicy(QComboBox.InsertPolicy.NoInsert)
+        self.subtype.addItems(types)
+        self.subtype.setCurrentIndex(-1)
+        self.subtype.lineEdit().setPlaceholderText("例如：测试电容、直通线")
+        form.addRow("名称", self.name)
+        form.addRow("自定义类型", self.subtype)
+        button = _dialog_buttons(form, self, "放置元件").button(QDialogButtonBox.StandardButton.Ok)
+
+        def update_button():
+            button.setEnabled(bool(self.name.text().strip() and self.subtype.currentText().strip()))
+
+        self.name.textChanged.connect(update_button)
+        self.subtype.currentTextChanged.connect(update_button)
+        update_button()
+
+
 class DefinitionDialog(QDialog):
     def __init__(self, scope: str, parent=None):
         super().__init__(parent)
@@ -590,7 +616,8 @@ class DevicePopup(QDialog):
         self.title.setText(f"<span>{tex_to_html(device['label'])}  ·  "
                            f"{DEVICE_NAMES[device['kind']]}</span>")
         self.editor.bind("device", self.device_id)
-        self.readout_info.setText(self.host.store.readout_summary(self.device_id))
+        self.readout_info.setText("\n".join(filter(None, (self.host.store.readout_summary(self.device_id),
+                                                        self.host.store.sample_box_summary(self.device_id)))))
         self.readout_info.setVisible(bool(self.readout_info.text()))
         point = self.host.point_combo.currentText() or "default"
         records = self.host.store.current_records(point)
@@ -690,11 +717,47 @@ class MainWindow(QMainWindow, WorkbenchLayout):
         self.set_theme(self.theme, persist=False)
         self.device_popup = DevicePopup(self)
         self.undo_controller = UndoController(self)
+        page = self.settings.value("layout/lastPageKey", "", type=str)
+        if not page:
+            previous = self.settings.value("layout/lastPage", 0, type=int)
+            keys = ("topology", "data", "fridge", "history")
+            page = keys[previous] if 0 <= previous < len(keys) else "topology"
+        keys = [self.navigation.item(i).data(Qt.ItemDataRole.UserRole) for i in range(self.navigation.count())]
+        if page in keys:
+            self.navigation.setCurrentRow(keys.index(page))
+        saved_pages = self.settings.value("layout/workspacePages", [], type=list)
+        saved_widths = self.settings.value("layout/workspaceWidths", [], type=list)
+        self.tabs.restore_layout([keys.index(key) if key in keys else -1 for key in saved_pages], saved_widths)
         if path:
             if Path(path).suffix.lower() == ".qfridge":
                 self._open_fridge_path(path)
             else:
                 self._open_path(path)
+        else:
+            self._restore_workspace_projects()
+
+    def _restore_workspace_projects(self):
+        unavailable = []
+        for key, open_project in (("chipPath", self._open_path), ("fridgePath", self._open_fridge_path)):
+            filename = self.settings.value(f"workspace/{key}", "", type=str)
+            if filename:
+                try:
+                    open_project(filename, restoring=True)
+                except Exception as exc:
+                    unavailable.append(f"{Path(filename).name}（{exc}）")
+        if self.store:
+            self.point_combo.setCurrentText(self.settings.value("workspace/workingPoint", "default", type=str))
+            view = self.settings.value("workspace/chipView", 0, type=int)
+            if 0 < view < self.chip_views.count():
+                self._show_chip_view(view)
+                self._refresh_energy_levels()
+        if not self.fridge_panel.preview:
+            self.fridge_panel.open_board(self.settings.value("workspace/fridgeBoard", "", type=str))
+            view = self.settings.value("workspace/fridgeView", 0, type=int)
+            if 0 <= view < self.fridge_panel.views.count():
+                self.fridge_panel.views.setCurrentIndex(view)
+        if unavailable:
+            self.statusBar().showMessage("上次的项目未能恢复：" + "；".join(unavailable), 15000)
 
     def set_theme(self, mode: str, persist: bool = True) -> None:
         self.theme = "dark" if mode == "dark" else "light"
@@ -730,10 +793,11 @@ class MainWindow(QMainWindow, WorkbenchLayout):
             self._refresh_energy_levels()
         if self.fridge_panel:
             self.fridge_panel.set_theme(self.theme)
+        self.sample_box_panel.refresh()
 
     def _sync_mode(self, chosen: QAction, checked: bool):
         actions = (self.view_action, self.place_action, self.place_coupler_action,
-                   self.place_readout_action, self.place_filter_action, self.connect_action)
+                   self.place_readout_action, self.place_filter_action, self.place_custom_action, self.connect_action)
         if checked:
             for action in actions:
                 if action is not chosen:
@@ -746,13 +810,15 @@ class MainWindow(QMainWindow, WorkbenchLayout):
             self.readout_visible_action.setChecked(True)
         if hasattr(self, "device_popup"):
             self.device_popup.close()
-        hints = {self.view_action: "查看模式 · 拖动平移，滚轮缩放",
+        hints = {self.view_action: "查看模式 · 左键点选或框选，右键拖动平移，滚轮缩放",
                  self.place_action: "放置比特 · 点击空格点",
                  self.place_coupler_action: "放置耦合器 · 点击空格点或半格",
                  self.place_readout_action: "放置读取线 · 依次点击起点和终点，吸附格点／半格 · Esc 取消",
                  self.place_filter_action: "放置可调 filter · 点击空格点或半格（可选元件）",
+                 self.place_custom_action: "放置自定义元件 · 点击空格点或半格",
                  self.connect_action: "连接模式 · 依次点击两个器件"}
         active = next(action for action in actions if action.isChecked())
+        self.view.setDragMode(QGraphicsView.DragMode.RubberBandDrag if active is self.view_action else QGraphicsView.DragMode.NoDrag)
         if hasattr(self, "mode_hint"):
             self.mode_hint.setText(hints[active])
         self._update_ui_state()
@@ -857,7 +923,7 @@ class MainWindow(QMainWindow, WorkbenchLayout):
             self._error("保存失败", exc)
             return False
 
-    def _open_path(self, path: str):
+    def _open_path(self, path: str, *, restoring=False):
         if not self._leave_file():
             return False
         try:
@@ -898,6 +964,8 @@ class MainWindow(QMainWindow, WorkbenchLayout):
             self._refresh_recent_menu()
             return True
         except Exception as exc:
+            if restoring:
+                raise
             self._error("无法打开文件", exc)
 
     def new_chip(self):
@@ -970,11 +1038,13 @@ class MainWindow(QMainWindow, WorkbenchLayout):
         if path:
             self._open_fridge_path(path)
 
-    def _open_fridge_path(self, path):
+    def _open_fridge_path(self, path, *, restoring=False):
         from .fridge_store import FridgeStore
         try:
-            self._show_fridge(FridgeStore.open(path))
+            self._show_fridge(FridgeStore.open(path), activate=not restoring)
         except Exception as exc:
+            if restoring:
+                raise
             self._error("打开制冷机项目失败", exc)
 
     def _show_fridge(self, store, *, activate=True, preview=False):
@@ -994,11 +1064,13 @@ class MainWindow(QMainWindow, WorkbenchLayout):
         self.fridge_title.setText("默认盘位预览 · 请新建或打开项目" if preview else store.name())
         self.fridge_title.setToolTip("" if preview else str(store.path))
         if activate:
-            self.navigation.setCurrentRow(2)
+            self.tabs.setCurrentWidget(self.fridge_page)
+        if self.tabs.is_page_visible(self.sample_box_panel):
+            self.sample_box_panel.refresh_connections()
         self._update_undo_action()
 
     def _active_fridge_panel(self):
-        if (self.fridge_panel and hasattr(self, "tabs") and self.tabs.currentIndex() == 2
+        if (self.fridge_panel and hasattr(self, "tabs") and self.tabs.currentWidget() is self.fridge_page
                 and self.fridge_workspace.currentWidget() is self.fridge_panel):
             return self.fridge_panel
         return None
@@ -1048,7 +1120,7 @@ class MainWindow(QMainWindow, WorkbenchLayout):
         old = self.field_combo.currentData()
         self.field_combo.blockSignals(True)
         self.field_combo.clear(); self.field_combo.addItem("原始构型", "")
-        scope_order = {"qubit": 0, "coupling": 1, "link": 2, "coupler": 3, "readout": 4, "filter": 5}
+        scope_order = {"qubit": 0, "coupling": 1, "link": 2, "coupler": 3, "readout": 4, "filter": 5, "custom": 6}
         for definition in sorted(self.store.definitions(), key=lambda d: scope_order[d["scope"]]):
             scope = {**DEVICE_NAMES, "link": "连接", "coupling": "两比特耦合"}[definition["scope"]]
             suffix = f" [{definition['unit']}]" if definition["unit"] else ""
@@ -1072,6 +1144,8 @@ class MainWindow(QMainWindow, WorkbenchLayout):
         self.refresh_wiring()
         self.refresh_detail()
         self.design_panel.refresh(self.store)
+        if self.tabs.is_page_visible(self.sample_box_panel):
+            self.sample_box_panel.refresh()
         self._refresh_energy_levels()
         if hasattr(self, "device_popup") and self.device_popup.isVisible():
             self.device_popup.reload()
@@ -1145,8 +1219,8 @@ class MainWindow(QMainWindow, WorkbenchLayout):
         if not self.store:
             return
         title = self.table_kind.currentText()
-        kind = {"比特": "device", "耦合器": "device", "读取线": "device",
-                "可调 filter": "device", "读取线连接": "readout_link", "比特-耦合器连接": "link",
+        kind = {**dict.fromkeys(DEVICE_NAMES.values(), "device"),
+                "读取线连接": "readout_link", "比特-耦合器连接": "link",
                 "耦合": "coupling"}.get(title)
         if self.table_orientation.currentData() == "vertical":
             ident = self._table_object_ids[_column-1] if 0 < _column <= len(self._table_object_ids) else None
@@ -1155,7 +1229,7 @@ class MainWindow(QMainWindow, WorkbenchLayout):
             ident = item.text() if item else None
         if kind and ident:
             self.selected = (kind, ident)
-            self.tabs.setCurrentIndex(0)
+            self.tabs.setCurrentWidget(self.topology_page)
             self.refresh_detail()
 
     def show_device_context_menu(self, ident: str, anchor: QPoint):
@@ -1202,7 +1276,8 @@ class MainWindow(QMainWindow, WorkbenchLayout):
             return
         kind = next((kind for action, kind in (
             (self.place_action, "qubit"), (self.place_coupler_action, "coupler"),
-            (self.place_readout_action, "readout"), (self.place_filter_action, "filter")
+            (self.place_readout_action, "readout"), (self.place_filter_action, "filter"),
+            (self.place_custom_action, "custom"),
         ) if action.isChecked()), None)
         if kind is None:
             return
@@ -1239,19 +1314,28 @@ class MainWindow(QMainWindow, WorkbenchLayout):
             self._error("位置已占用", f"({c:g}, {r:g}) 已有器件")
             return
         default_label = self.store.next_device_label(kind)
-        name_prompt = ("器件名称（保留默认值时，连接两个比特后自动命名）" if kind == "coupler" else
-                       "器件名称（支持 q_{1}、\\omega_{01}）")
-        label, ok = QInputDialog.getText(self, f"放置{DEVICE_NAMES[kind]}", name_prompt, text=default_label)
-        if not ok or not label.strip():
-            return
-        choices = SUBTYPES[kind]
-        device_type = choices[-1][1]
-        if len(choices) > 1:
-            subtype, ok = QInputDialog.getItem(self, "器件类型", "类型",
-                                             [caption for caption, _ in reversed(choices)], 0, False)
-            if not ok:
+        if kind == "custom":
+            types = sorted({device["subtype"] for device in self.store.devices("custom")})
+            dialog = CustomDeviceDialog(default_label, types, self)
+            result = dialog.exec()
+            label, device_type = dialog.name.text(), dialog.subtype.currentText()
+            dialog.deleteLater()
+            if result != QDialog.DialogCode.Accepted:
                 return
-            device_type = next(value for caption, value in choices if caption == subtype)
+        else:
+            name_prompt = ("器件名称（保留默认值时，连接两个比特后自动命名）" if kind == "coupler" else
+                           "器件名称（支持 q_{1}、\\omega_{01}）")
+            label, ok = QInputDialog.getText(self, f"放置{DEVICE_NAMES[kind]}", name_prompt, text=default_label)
+            if not ok or not label.strip():
+                return
+            choices = SUBTYPES[kind]
+            device_type = choices[-1][1]
+            if len(choices) > 1:
+                subtype, ok = QInputDialog.getItem(self, "器件类型", "类型",
+                                                 [caption for caption, _ in reversed(choices)], 0, False)
+                if not ok:
+                    return
+                device_type = next(value for caption, value in choices if caption == subtype)
         try:
             ident = self.store.add_device(kind, device_type, None if label.strip() == default_label else label, c, r,
                                           readout_id=readout_id, readout_position=filter_position,
@@ -1325,7 +1409,8 @@ class MainWindow(QMainWindow, WorkbenchLayout):
                 scope = obj["kind"]
                 self.selected_title.setText(f"<b>{tex_to_html(obj['label'])}</b> · {DEVICE_NAMES[scope]}")
                 name = obj["label"]
-                self.readout_info.setText(self.store.readout_summary(ident))
+                self.readout_info.setText("\n".join(filter(None, (self.store.readout_summary(ident),
+                                                                self.store.sample_box_summary(ident)))))
             elif kind == "readout_link":
                 obj = self.store.readout_link(ident); scope = "readout_link"
                 a = self.store.device(obj["readout_id"])["label"]
@@ -1442,7 +1527,7 @@ class MainWindow(QMainWindow, WorkbenchLayout):
 
     @undoable("删除所选对象")
     def delete_selected(self):
-        if (not self.store or not self.selected or self.tabs.currentIndex() != 0
+        if (not self.store or not self.selected or self.tabs.currentWidget() is not self.topology_page
                 or self.chip_views.currentIndex() != 0):
             return
         name = self.delete_action.text().removeprefix("删除 ")
@@ -1875,11 +1960,13 @@ class MainWindow(QMainWindow, WorkbenchLayout):
 
     def show_version_info(self):
         from .migrations import MIGRATIONS
+        from .fridge_store import FRIDGE_SCHEMA_VERSION
         supported = "、".join(f"v{version}" for version in sorted((*MIGRATIONS, SCHEMA_VERSION)))
         QMessageBox.information(self, "版本信息",
                                 f"Qubit Sequencer\n软件版本：{__version__}\n\n"
                                 f"当前 .qchip 文件格式：v{SCHEMA_VERSION}\n"
                                 f"支持打开的 .qchip 文件版本：{supported}\n\n"
+                                f"当前 .qfridge 文件格式：v{FRIDGE_SCHEMA_VERSION}（支持 v1–v{FRIDGE_SCHEMA_VERSION}）\n\n"
                                 "旧版本项目打开时会先自动备份，再升级到当前格式。\n"
                                 f"高于 v{SCHEMA_VERSION} 的项目暂不支持。")
 
@@ -1887,11 +1974,23 @@ class MainWindow(QMainWindow, WorkbenchLayout):
         if not self._leave_file():
             event.ignore()
             return
+        self.settings.setValue("layout/lastPageKey", self.navigation.currentItem().data(Qt.ItemDataRole.UserRole))
+        pages, widths = self.tabs.layout_state()
+        self.settings.setValue("layout/workspacePages", [self.navigation.item(i).data(Qt.ItemDataRole.UserRole) for i in pages])
+        self.settings.setValue("layout/workspaceWidths", widths)
+        fridge = self.fridge_panel if self.fridge_panel and not self.fridge_panel.preview else None
+        self.settings.setValue("workspace/chipPath", str(self.store.path.resolve()) if self.store else "")
+        self.settings.setValue("workspace/fridgePath", str(fridge.store.path) if fridge else "")
+        self.settings.setValue("workspace/workingPoint", self.point_combo.currentText())
+        self.settings.setValue("workspace/chipView", self.chip_views.currentIndex())
+        self.settings.setValue("workspace/fridgeBoard", (fridge.board.currentData() or "") if fridge else "")
+        self.settings.setValue("workspace/fridgeView", fridge.views.currentIndex() if fridge else 0)
         if self.fridge_panel:
             self.fridge_panel.close()
             self.fridge_panel = None
         self.settings.setValue("layout/geometry", self.saveGeometry())
         self._remember_split()
+        self.settings.sync()
         if hasattr(self, "device_popup"):
             self.device_popup.close()
             self.device_popup.editor.clear()

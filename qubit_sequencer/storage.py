@@ -17,12 +17,13 @@ from uuid import uuid4
 from .attachment_store import AttachmentStore, AttachmentInput, AttachmentChange, ATTACHMENT_SCHEMA
 from .design_store import DesignStore, DESIGN_SCHEMA
 from .undo import undoable
-from .device_types import DEVICE_PREFIXES, SUBTYPES
+from .device_types import DEVICE_NAMES, DEVICE_PREFIXES, device_subtype
 from .readout_store import ReadoutStore, READOUT_SCHEMA, project_to_readout, readout_point
 from .wiring_store import WiringStore, WIRING_SCHEMA
+from .sample_box_store import SampleBoxStore, SAMPLE_BOX_SCHEMA
 from .parameter_rules import CALIBRATION_PRESETS, PRIMARY_ORDER, record_value, validate_bias_z
 
-SCHEMA_VERSION = 8
+SCHEMA_VERSION = 10
 FORMAT_NAME = "qchip"
 BEIJING = timezone(timedelta(hours=8), "UTC+08:00")
 
@@ -110,7 +111,7 @@ _DEFINITION_COLUMNS = f"key,{_LABEL_CASE},scope,category,value_type,unit,is_cust
 SCHEMA = """
 CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
 CREATE TABLE devices (
- id TEXT PRIMARY KEY, kind TEXT NOT NULL CHECK(kind IN ('qubit','coupler','readout','filter')),
+ id TEXT PRIMARY KEY, kind TEXT NOT NULL CHECK(kind IN ('qubit','coupler','readout','filter','custom')),
  subtype TEXT NOT NULL, label TEXT NOT NULL UNIQUE, role TEXT NOT NULL DEFAULT '',
  x REAL NOT NULL, y REAL NOT NULL, dx REAL NOT NULL DEFAULT 0, dy REAL NOT NULL DEFAULT 0,
  notes TEXT NOT NULL DEFAULT '', created_at TEXT NOT NULL,
@@ -148,7 +149,7 @@ CREATE TABLE wiring_assignments (
 );
 CREATE TABLE parameter_definitions (
  key TEXT PRIMARY KEY, label TEXT NOT NULL, scope TEXT NOT NULL
- CHECK(scope IN ('qubit','coupler','readout','filter','coupling','link')),
+ CHECK(scope IN ('qubit','coupler','readout','filter','custom','coupling','link')),
  category TEXT NOT NULL CHECK(category IN ('measured','design','custom')),
  value_type TEXT NOT NULL CHECK(value_type IN ('number','text')),
  unit TEXT NOT NULL DEFAULT '', is_custom INTEGER NOT NULL DEFAULT 0
@@ -187,9 +188,10 @@ SCHEMA += ATTACHMENT_SCHEMA
 SCHEMA += DESIGN_SCHEMA
 SCHEMA += WIRING_SCHEMA
 SCHEMA += READOUT_SCHEMA
+SCHEMA += SAMPLE_BOX_SCHEMA
 
 
-class ChipStore(AttachmentStore, DesignStore, WiringStore, ReadoutStore):
+class ChipStore(AttachmentStore, DesignStore, WiringStore, ReadoutStore, SampleBoxStore):
     def __init__(self, path: str | Path, connection: sqlite3.Connection):
         self.path = Path(path)
         self.db = connection
@@ -302,10 +304,9 @@ class ChipStore(AttachmentStore, DesignStore, WiringStore, ReadoutStore):
     def add_device(self, kind: str, subtype: str, label: str | None, x: float, y: float,
                    role: str = "", notes: str = "", *, readout_id=None, readout_position=None,
                    readout_endpoints=None) -> str:
-        if kind not in SUBTYPES:
+        if kind not in DEVICE_NAMES:
             raise ValueError("invalid device kind")
-        if subtype not in {value for _, value in SUBTYPES[kind]}:
-            raise ValueError("invalid device subtype")
+        subtype = device_subtype(kind, subtype)
         number, default_label = self._next_device_name(kind)
         auto_name = kind == "coupler" and label is None
         label = default_label if label is None else label
@@ -345,9 +346,8 @@ class ChipStore(AttachmentStore, DesignStore, WiringStore, ReadoutStore):
         if not changes or set(changes) - allowed:
             raise ValueError("invalid device fields")
         old = self.device(ident)
-        subtype = changes.get("subtype", old["subtype"])
-        if subtype not in {value for _, value in SUBTYPES[old["kind"]]}:
-            raise ValueError("invalid device subtype")
+        if "subtype" in changes:
+            changes["subtype"] = device_subtype(old["kind"], changes["subtype"])
         if "label" in changes and not str(changes["label"]).strip():
             raise ValueError("label cannot be empty")
         for field in ("x", "y", "dx", "dy"):
@@ -615,7 +615,7 @@ class ChipStore(AttachmentStore, DesignStore, WiringStore, ReadoutStore):
     @undoable("添加自定义参数")
     def add_definition(self, key: str, label: str, scope: str, value_type: str = "number",
                        unit: str = "", category: str = "custom") -> None:
-        if scope not in (*SUBTYPES, "coupling", "link") or value_type not in ("number", "text"):
+        if scope not in (*DEVICE_NAMES, "coupling", "link") or value_type not in ("number", "text"):
             raise ValueError("invalid parameter definition")
         if category not in ("design", "measured", "custom") or not key.strip() or not label.strip():
             raise ValueError("invalid parameter definition")

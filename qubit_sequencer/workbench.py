@@ -9,9 +9,12 @@ from PySide6.QtWidgets import (
     QTableWidget, QToolButton, QVBoxLayout, QWidget,
 )
 from .editors import DeviceEditor
+from .device_types import DEVICE_NAMES
 from .design_ui import ChipDesignPanel
 from .energy_levels import EnergyLevelsPanel
+from .sample_box_ui import SampleBoxPanel
 from .wiring_store import LINE_TYPES
+from .workspace_columns import WorkspaceColumns
 
 
 class ProjectTitle(QLabel):
@@ -79,8 +82,8 @@ class WorkbenchLayout:
             if key in ("xlsx", "csv", "image", "images"):
                 self.export_menu.addAction(action)
         file_menu.addSeparator()
-        file_menu.addAction("新建制冷机项目…", self.new_fridge)
-        file_menu.addAction("打开制冷机项目…", self.open_fridge)
+        file_menu.addAction(self._action("新建制冷机项目", self.new_fridge, "new"))
+        file_menu.addAction(self._action("打开制冷机项目", self.open_fridge, "open"))
         edit_menu = self.menuBar().addMenu("编辑")
         self.undo_action = self._action("撤回", self.undo_edit, "undo", "Ctrl+Z")
         self.redo_action = self._action("恢复（重做）", self.redo_edit, "redo", "Ctrl+Y")
@@ -88,6 +91,9 @@ class WorkbenchLayout:
         edit_menu.addAction(self.undo_action); edit_menu.addAction(self.redo_action)
         self._update_undo_action()
         view_menu = self.menuBar().addMenu("视图")
+        self.multi_column_action = view_menu.addAction("多栏模式")
+        self.multi_column_action.setCheckable(True)
+        self.multi_column_action.toggled.connect(lambda checked: self.tabs.set_multicolumn(checked))
         self.readout_visible_action = QAction("显示读取线和 filter", self)
         self.readout_visible_action.setCheckable(True); self.readout_visible_action.setChecked(True)
         self.readout_visible_action.toggled.connect(self._set_readout_visible)
@@ -140,12 +146,14 @@ class WorkbenchLayout:
         self.navigation.setFixedWidth(160); self.navigation.setIconSize(QSize(20, 20))
         self.navigation.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         self.navigation.setSpacing(4)
-        for caption, symbol in (("芯片构型", "chip"), ("参数数据表", "table"),
-                                ("制冷机布线", "wiring"), ("参数历史", "history")):
+        for key, caption, symbol in (("topology", "芯片构型", "chip"), ("sample_box", "样品盒构型", "sample_box"),
+                                     ("data", "参数数据表", "table"), ("fridge", "制冷机布线", "wiring"),
+                                     ("history", "参数历史", "history")):
             item = QListWidgetItem(caption); item.setSizeHint(QSize(144, 40))
+            item.setData(Qt.ItemDataRole.UserRole, key)
             self.navigation.addItem(item); self._icon_bindings.append((item, symbol))
         body.addWidget(self.navigation)
-        self.tabs = QStackedWidget(); body.addWidget(self.tabs, 1)
+        self.tabs = WorkspaceColumns(); body.addWidget(self.tabs, 1)
         root_layout.addLayout(body, 1)
         diagram_page = QWidget(); diagram_layout = QVBoxLayout(diagram_page)
         diagram_layout.setContentsMargins(12, 12, 12, 12); diagram_layout.setSpacing(8)
@@ -172,6 +180,7 @@ class WorkbenchLayout:
         self.place_coupler_action = QAction("耦合器", self); self.place_coupler_action.setCheckable(True)
         self.place_readout_action = QAction("读取线", self); self.place_readout_action.setCheckable(True)
         self.place_filter_action = QAction("可调 filter", self); self.place_filter_action.setCheckable(True)
+        self.place_custom_action = QAction(DEVICE_NAMES["custom"], self); self.place_custom_action.setCheckable(True)
         self.connect_action = QAction("连接", self); self.connect_action.setCheckable(True)
         self.add_component_button = self._tool_button("添加元件", symbol="new", role="ghost")
         self.add_component_button.setToolTip("选择元件后，在构型图上放置")
@@ -179,11 +188,12 @@ class WorkbenchLayout:
         self.add_component_menu.setToolTipsVisible(True)
         self.add_component_button.setMenu(self.add_component_menu)
         self.add_component_button.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
-        for action, symbol, tip in ((self.view_action, "select", "点击查看；拖动空白平移，滚轮缩放"),
+        for action, symbol, tip in ((self.view_action, "select", "左键点选或框选；右键拖动平移，滚轮缩放"),
                                     (self.place_action, "qubit", "点击格点放置比特"),
                                     (self.place_coupler_action, "coupler", "点击格点放置耦合器"),
                                     (self.place_readout_action, "readout", "依次点击起点和终点，自动吸附格点／半格；Esc 取消"),
                                     (self.place_filter_action, "filter", "点击读取线、空格点或半格放置可调 filter"),
+                                    (self.place_custom_action, "custom", "点击空格点或半格放置自定义元件"),
                                     (self.connect_action, "connect", "依次点击两个器件建立连接")):
             action.setToolTip(tip); self._icon_bindings.append((action, symbol))
             if action in (self.view_action, self.connect_action):
@@ -266,7 +276,7 @@ class WorkbenchLayout:
         self.diagram_splitter.setSizes([900, width]); self.diagram_splitter.splitterMoved.connect(self._remember_split)
         topology_layout.addWidget(self.diagram_splitter, 1)
         bottom = QHBoxLayout()
-        self.mode_hint = QLabel("查看模式 · 拖动平移，滚轮缩放"); self.mode_hint.setProperty("role", "muted")
+        self.mode_hint = QLabel("查看模式 · 左键点选或框选，右键拖动平移，滚轮缩放"); self.mode_hint.setProperty("role", "muted")
         bottom.addWidget(self.mode_hint, 1)
         self.inspector_toggle = self._tool_button("详情", lambda: self.set_inspector_visible(self.inspector_container.isHidden()),
                                                  "chevron", "ghost")
@@ -281,12 +291,14 @@ class WorkbenchLayout:
         self.energy_panel = EnergyLevelsPanel()
         self.energy_panel.frequency_source.currentIndexChanged.connect(lambda: self._refresh_energy_levels())
         self.chip_views.addWidget(self.energy_panel)
-        self.tabs.addWidget(diagram_page)
+        self.topology_page = diagram_page
+        self.tabs.addWidget(diagram_page, "芯片构型")
+        self.sample_box_panel = SampleBoxPanel(self); self.tabs.addWidget(self.sample_box_panel, "样品盒构型")
         data_page = QWidget(); data_layout = QVBoxLayout(data_page)
         data_layout.setContentsMargins(16, 12, 16, 12); data_layout.setSpacing(12)
         heading = QLabel("参数数据表"); heading.setProperty("role", "heading"); data_layout.addWidget(heading)
         row = QHBoxLayout(); row.setSpacing(8)
-        self.table_kind = QComboBox(); self.table_kind.addItems(["比特", "耦合器", "读取线", "可调 filter", "读取线连接", "比特-耦合器连接", "耦合", "接线"])
+        self.table_kind = QComboBox(); self.table_kind.addItems([*DEVICE_NAMES.values(), "读取线连接", "比特-耦合器连接", "耦合", "接线"])
         self.table_kind.currentTextChanged.connect(self.refresh_tables); row.addWidget(self.table_kind)
         self.table_orientation = QComboBox()
         self.table_orientation.addItem("横向 · 器件为行", "horizontal"); self.table_orientation.addItem("纵向 · 器件为列", "vertical")
@@ -307,7 +319,7 @@ class WorkbenchLayout:
         self.tex_delegate = TexTableDelegate(self.data_table); self.data_table.setItemDelegate(self.tex_delegate)
         self.data_table.cellDoubleClicked.connect(self.on_data_row_double_clicked); data_layout.addWidget(self.data_table, 1)
         self.table_summary = QLabel(); self.table_summary.setProperty("role", "muted"); data_layout.addWidget(self.table_summary)
-        self.tabs.addWidget(data_page)
+        self.data_page = data_page; self.tabs.addWidget(data_page, "参数数据表")
         wiring_page = QWidget(); wiring_layout = QVBoxLayout(wiring_page)
         wiring_layout.setContentsMargins(16, 12, 16, 12); wiring_layout.setSpacing(12)
         fridge_row = QHBoxLayout()
@@ -362,7 +374,7 @@ class WorkbenchLayout:
         detail_scroll = QScrollArea(); detail_scroll.setWidgetResizable(True)
         detail_scroll.setWidget(self.wiring_detail); detail_scroll.setMinimumHeight(140); detail_scroll.setMaximumHeight(200)
         wiring_layout.addWidget(detail_scroll)
-        self.tabs.addWidget(wiring_page)
+        self.fridge_page = wiring_page; self.tabs.addWidget(wiring_page, "制冷机布线")
         history_page = QWidget(); history_layout = QVBoxLayout(history_page)
         history_layout.setContentsMargins(16, 12, 16, 12); history_layout.setSpacing(12)
         heading = QLabel("参数历史"); heading.setProperty("role", "heading"); history_layout.addWidget(heading)
@@ -381,9 +393,13 @@ class WorkbenchLayout:
         self.history_table.setSortingEnabled(True)
         self.history_table.itemSelectionChanged.connect(self._update_ui_state)
         self.history_table.cellDoubleClicked.connect(self.manage_history_attachments)
-        history_layout.addWidget(self.history_table, 1); self.tabs.addWidget(history_page)
+        self.history_page = history_page
+        history_layout.addWidget(self.history_table, 1); self.tabs.addWidget(history_page, "参数历史")
         self.navigation.currentRowChanged.connect(self.tabs.setCurrentIndex)
-        self.tabs.currentChanged.connect(self._page_changed); self.navigation.setCurrentRow(0)
+        self.tabs.currentChanged.connect(self._page_changed)
+        self._visible_workspace_pages = set()
+        self.tabs.layoutChanged.connect(self._workspace_layout_changed)
+        self.navigation.setCurrentRow(0)
         self.field_combo.currentIndexChanged.connect(self.refresh_scene)
         self.point_combo.currentTextChanged.connect(self.refresh_parameter_views)
         self.file_status = QLabel("未打开文件"); self.file_status.setProperty("role", "muted")
@@ -393,15 +409,24 @@ class WorkbenchLayout:
 
     def _page_changed(self, index):
         self.navigation.blockSignals(True); self.navigation.setCurrentRow(index); self.navigation.blockSignals(False)
-        if index == 2 and self.fridge_panel:
-            self.fridge_panel.refresh_filters(); self.fridge_panel.refresh()
-        self.first_endpoint = None
-        self.view_action.setChecked(True)
-        self.design_panel.edit_button.setChecked(False)
-        if hasattr(self, "device_popup"):
+        if self.tabs.currentWidget() is not self.topology_page and hasattr(self, "device_popup"):
             self.device_popup.close()
         self._update_ui_state()
         self._update_undo_action()
+
+    def _workspace_layout_changed(self):
+        self.multi_column_action.setChecked(self.tabs.multicolumn)
+        visible = {self.tabs.widget(index) for index in self.tabs.visible_indices()}
+        revealed = visible - self._visible_workspace_pages
+        self._visible_workspace_pages = visible
+        if self.fridge_page in revealed and self.fridge_panel:
+            self.fridge_panel.refresh_filters(); self.fridge_panel.refresh()
+        if self.sample_box_panel in revealed:
+            self.sample_box_panel.refresh()
+        if not self.tabs.multicolumn or self.topology_page not in visible:
+            self.first_endpoint = None
+            self.view_action.setChecked(True)
+            self.design_panel.edit_button.setChecked(False)
 
     def _show_chip_design(self, visible):
         self._show_chip_view(1 if visible else 0)
@@ -449,7 +474,7 @@ class WorkbenchLayout:
         if not opened:
             self.parameter_visibility_button.setEnabled(False)
         for action in (self.view_action, self.place_action, self.place_coupler_action,
-                       self.place_readout_action, self.place_filter_action, self.connect_action):
+                       self.place_readout_action, self.place_filter_action, self.place_custom_action, self.connect_action):
             action.setEnabled(opened and showing_topology)
         self.connection_mode.setEnabled(opened and showing_topology and self.connect_action.isChecked())
         self.field_combo.setEnabled(opened and showing_topology)
@@ -457,7 +482,7 @@ class WorkbenchLayout:
         dirty = selected and self.drafts.dirty(*self.selected)
         self.save_button.setEnabled(bool(dirty)); self.reset_button.setEnabled(bool(dirty)); self.custom_button.setEnabled(selected)
         self.custom_button.setEnabled(selected and self.selected[0] != "readout_link")
-        self.delete_action.setEnabled(selected and self.tabs.currentIndex() == 0 and showing_topology)
+        self.delete_action.setEnabled(selected and self.tabs.currentWidget() is self.topology_page and showing_topology)
         count = len(self.drafts.dirty_keys()) if opened else 0
         self.draft_status.setText(f"{count} 项未保存" if count else "")
         line_selected = bool(opened and self._chosen_line_id())

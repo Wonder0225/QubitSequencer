@@ -56,6 +56,16 @@ DIAGRAM_COLORS = {
 }
 
 
+def custom_device_colors(subtypes):
+    """Assign one color per project type across all chip views and themes."""
+    palette = DIAGRAM_COLORS["light"]["categories"]
+    return {
+        subtype: palette[index] if index < len(palette) else
+        QColor.fromHslF(((index - len(palette)) * .618034 + .08) % 1, .55, .46).name()
+        for index, subtype in enumerate(sorted(set(subtypes)))
+    }
+
+
 def palette(mode: str) -> QPalette:
     """Supply native widgets with matching active, inactive and disabled colors."""
     c = UI_COLORS[mode]
@@ -260,6 +270,7 @@ def stylesheet(mode: str) -> str:
         QGraphicsView {{ background: {c['panel']}; border: 1px solid {c['border']}; }}
         QSplitter::handle {{ background: {c['border']}; }}
         QSplitter::handle:hover {{ background: {c['accent']}; }}
+        QWidget#workspaceColumnHeader {{ background: {c['toolbar']}; border-bottom: 1px solid {c['border']}; }}
         QScrollBar:vertical {{ background: {c['window']}; width: 10px; margin: 0; }}
         QScrollBar:horizontal {{ background: {c['window']}; height: 10px; margin: 0; }}
         QScrollBar::handle:vertical {{ background: {c['border']}; border-radius: 4px; min-height: 24px; margin: 1px 2px; }}

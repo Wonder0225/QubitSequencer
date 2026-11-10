@@ -20,8 +20,10 @@ from openpyxl import Workbook
 from .undo import undoable
 from .fridge_templates import TEMPLATE_NAMES, nearest_free_point, snap_to_grid, template_grid, template_ports
 from .fridge_presets import preset_for
+from .sample_box_store import BOX_ROLES, box_number_source, sample_box_ports
 
 
+FRIDGE_SCHEMA_VERSION = 3
 SCHEMA = """
 CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
 CREATE TABLE samples (id TEXT PRIMARY KEY, name TEXT NOT NULL, path TEXT NOT NULL);
@@ -29,13 +31,13 @@ CREATE TABLE ports (id TEXT PRIMARY KEY, board TEXT NOT NULL, number TEXT NOT NU
  x REAL NOT NULL, y REAL NOT NULL, kind TEXT NOT NULL, UNIQUE(board, number));
 CREATE TABLE assignments (port_id TEXT PRIMARY KEY REFERENCES ports(id) ON DELETE CASCADE,
  sample_id TEXT NOT NULL REFERENCES samples(id), usage TEXT NOT NULL, pin TEXT NOT NULL, drawing TEXT NOT NULL,
- devices_json TEXT NOT NULL, notes TEXT NOT NULL, legacy_json TEXT NOT NULL);
+ devices_json TEXT NOT NULL, notes TEXT NOT NULL, legacy_json TEXT NOT NULL, box_port_id TEXT);
 CREATE TABLE port_circuits (port_id TEXT PRIMARY KEY REFERENCES ports(id) ON DELETE CASCADE,
  circuit_json TEXT NOT NULL);
 CREATE TABLE branch_assignments (port_id TEXT NOT NULL REFERENCES ports(id) ON DELETE CASCADE,
  branch TEXT NOT NULL, sample_id TEXT NOT NULL REFERENCES samples(id), usage TEXT NOT NULL,
  pin TEXT NOT NULL, drawing TEXT NOT NULL, devices_json TEXT NOT NULL, notes TEXT NOT NULL,
- legacy_json TEXT NOT NULL, PRIMARY KEY(port_id,branch));
+ legacy_json TEXT NOT NULL, box_port_id TEXT, PRIMARY KEY(port_id,branch));
 """
 
 
@@ -105,7 +107,7 @@ class FridgeStore:
         try:
             db.executescript(SCHEMA)
             db.executemany("INSERT INTO meta VALUES (?,?)", [("format", "qfridge"), ("name", name)])
-            db.execute("PRAGMA user_version=2")
+            db.execute(f"PRAGMA user_version={FRIDGE_SCHEMA_VERSION}")
             db.executemany("INSERT INTO ports VALUES (?,?,?,?,?,?)", default_ports())
             if with_preset:
                 for port_id, board, number in db.execute("SELECT id,board,number FROM ports").fetchall():
@@ -128,22 +130,25 @@ class FridgeStore:
         try:
             marker = db.execute("SELECT value FROM meta WHERE key='format'").fetchone()
             version = db.execute("PRAGMA user_version").fetchone()[0]
-            if not marker or marker[0] != "qfridge" or version not in (1, 2):
+            if not marker or marker[0] != "qfridge" or version not in (1, 2, FRIDGE_SCHEMA_VERSION):
                 raise ValueError("不支持的 .qfridge 文件")
-            if version == 1:
-                backup = path.with_name(f"{path.stem}.pre-v1.qfridge")
+            if version < FRIDGE_SCHEMA_VERSION:
+                backup = path.with_name(f"{path.stem}.pre-v{version}.qfridge")
                 if backup.exists():
                     raise FileExistsError(backup)
                 with closing(sqlite3.connect(backup)) as target:
                     db.backup(target)
                 with db:
                     db.execute("BEGIN IMMEDIATE")
-                    db.execute("CREATE TABLE port_circuits (port_id TEXT PRIMARY KEY REFERENCES ports(id) ON DELETE CASCADE, circuit_json TEXT NOT NULL)")
-                    db.execute("""CREATE TABLE branch_assignments (port_id TEXT NOT NULL REFERENCES ports(id) ON DELETE CASCADE,
-                        branch TEXT NOT NULL, sample_id TEXT NOT NULL REFERENCES samples(id), usage TEXT NOT NULL,
-                        pin TEXT NOT NULL, drawing TEXT NOT NULL, devices_json TEXT NOT NULL, notes TEXT NOT NULL,
-                        legacy_json TEXT NOT NULL, PRIMARY KEY(port_id,branch))""")
-                    db.execute("PRAGMA user_version=2")
+                    if version == 1:
+                        db.execute("CREATE TABLE port_circuits (port_id TEXT PRIMARY KEY REFERENCES ports(id) ON DELETE CASCADE, circuit_json TEXT NOT NULL)")
+                        db.execute("""CREATE TABLE branch_assignments (port_id TEXT NOT NULL REFERENCES ports(id) ON DELETE CASCADE,
+                            branch TEXT NOT NULL, sample_id TEXT NOT NULL REFERENCES samples(id), usage TEXT NOT NULL,
+                            pin TEXT NOT NULL, drawing TEXT NOT NULL, devices_json TEXT NOT NULL, notes TEXT NOT NULL,
+                            legacy_json TEXT NOT NULL, PRIMARY KEY(port_id,branch))""")
+                    db.execute("ALTER TABLE assignments ADD COLUMN box_port_id TEXT")
+                    db.execute("ALTER TABLE branch_assignments ADD COLUMN box_port_id TEXT")
+                    db.execute(f"PRAGMA user_version={FRIDGE_SCHEMA_VERSION}")
             store = cls(path, db)
             store.align_existing()
             return store
@@ -170,7 +175,45 @@ class FridgeStore:
         with closing(_read_chip(self.sample_path(sample_id))) as db:
             columns = {r[1] for r in db.execute("PRAGMA table_info(devices)")}
             drawing = "drawing_number" if "drawing_number" in columns else "'' AS drawing_number"
-            return [dict(row) for row in db.execute(f"SELECT id,label,kind,{drawing} FROM devices ORDER BY label")]
+            return [dict(row) for row in db.execute(f"SELECT id,label,kind,subtype,{drawing} FROM devices ORDER BY label")]
+
+    @staticmethod
+    def _box_ports(db):
+        if db.execute("PRAGMA user_version").fetchone()[0] < 9:
+            return []
+        return [dict(row) for row in sample_box_ports(db)]
+
+    def sample_box_ports(self, sample_id):
+        with closing(_read_chip(self.sample_path(sample_id))) as db:
+            return self._box_ports(db)
+
+    def box_connections(self, sample_id, box_port_id=None):
+        return self.db.execute("""SELECT p.id,p.board,p.number,a.branch,a.box_port_id FROM ports p JOIN (
+            SELECT port_id, NULL AS branch, box_port_id FROM assignments WHERE sample_id=?
+            UNION ALL SELECT port_id, branch, box_port_id FROM branch_assignments WHERE sample_id=?
+            ) a ON a.port_id=p.id WHERE a.box_port_id IS NOT NULL AND (? IS NULL OR a.box_port_id=?)""",
+                               (sample_id, sample_id, box_port_id, box_port_id)).fetchall()
+
+    def resolve_assignment(self, row, box_cache=None):
+        if not row["box_port_id"]:
+            return None, "", self.resolve_devices(row["sample_id"], json.loads(row["devices_json"]))
+        sample_id = row["sample_id"]
+        cache = {} if box_cache is None else box_cache
+        if sample_id not in cache:
+            try:
+                cache[sample_id] = {p["id"]: p for p in self.sample_box_ports(sample_id)}
+            except (OSError, sqlite3.Error, ValueError):
+                cache[sample_id] = None
+        if cache[sample_id] is None:
+            return None, "样品不可用", []
+        port = cache[sample_id].get(row["box_port_id"])
+        if port is None:
+            return None, "样品盒接口不可用", []
+        if port["device_id"] is None:
+            return port, "接口未关联元件", []
+        return port, "已连接", [dict(id=port["device_id"], label=port["device_label"],
+                                     kind=port["device_kind"], subtype=port["device_subtype"],
+                                     drawing_number=port["drawing_number"])]
 
     def resolve_devices(self, sample_id, saved):
         try:
@@ -196,7 +239,10 @@ class FridgeStore:
     def relocate_sample(self, sample_id, path):
         with closing(_read_chip(path)) as db:
             ids = {r[0] for r in db.execute("SELECT id FROM devices")}
-        used = {d["id"] for row in self.db.execute("SELECT devices_json FROM assignments WHERE sample_id=? UNION ALL SELECT devices_json FROM branch_assignments WHERE sample_id=?", (sample_id, sample_id))
+            box_ids = {r["box_port_id"] for r in self.box_connections(sample_id)}
+            if box_ids and not box_ids <= {r["id"] for r in self._box_ports(db)}:
+                raise ValueError("所选样品不包含已关联的样品盒接口，请选择原样品文件")
+        used = {d["id"] for row in self.db.execute("SELECT devices_json FROM assignments WHERE sample_id=? AND box_port_id IS NULL UNION ALL SELECT devices_json FROM branch_assignments WHERE sample_id=? AND box_port_id IS NULL", (sample_id, sample_id))
                 for d in json.loads(row[0])}
         if not used <= ids:
             raise ValueError("所选样品不包含已关联的器件，请选择原样品文件")
@@ -207,6 +253,8 @@ class FridgeStore:
 
     @undoable("移除样品")
     def remove_sample(self, sample_id):
+        for row in self.db.execute("SELECT port_id,NULL AS branch FROM assignments WHERE sample_id=? UNION ALL SELECT port_id,branch FROM branch_assignments WHERE sample_id=?", (sample_id, sample_id)):
+            self._check_available(row[0], row[1])
         with self.db:
             self.db.execute("DELETE FROM assignments WHERE sample_id=?", (sample_id,))
             self.db.execute("DELETE FROM branch_assignments WHERE sample_id=?", (sample_id,))
@@ -215,14 +263,88 @@ class FridgeStore:
     def ports(self):
         return self.db.execute("""SELECT p.*, a.sample_id AS direct_sample_id,
           COALESCE(a.sample_id,(SELECT b.sample_id FROM branch_assignments b WHERE b.port_id=p.id LIMIT 1)) AS sample_id,
-          a.usage, a.pin, a.drawing, a.devices_json, a.notes, a.legacy_json,
+          a.usage, a.pin, a.drawing, a.devices_json, a.notes, a.legacy_json, a.box_port_id,
           COALESCE(s.name,(SELECT s2.name FROM branch_assignments b JOIN samples s2 ON s2.id=b.sample_id WHERE b.port_id=p.id LIMIT 1)) AS sample_name,
-          (SELECT COUNT(*) FROM branch_assignments b WHERE b.port_id=p.id) AS branch_count
+          (SELECT COUNT(*) FROM branch_assignments b WHERE b.port_id=p.id) AS branch_count,
+          EXISTS(SELECT 1 FROM meta m WHERE m.key='occupied:' || p.id) AS manually_occupied,
+          COALESCE((SELECT value FROM meta m WHERE m.key='occupied:' || p.id), '') AS manual_status,
+          COALESCE((SELECT value FROM meta m WHERE m.key='occupied_drawing:' || p.id), '{}') AS occupied_drawings
           FROM ports p LEFT JOIN assignments a ON p.id=a.port_id
           LEFT JOIN samples s ON s.id=a.sample_id ORDER BY p.board,p.y,p.x""").fetchall()
 
     def port(self, port_id):
         return next(row for row in self.ports() if row["id"] == port_id)
+
+    def check_wiring_types(self):
+        """Compare every recorded assignment with its physical port type."""
+        rows = self.db.execute("""SELECT p.board,p.number,p.kind,w.branch,w.usage,s.name AS sample_name
+            FROM (SELECT port_id,sample_id,usage,NULL AS branch FROM assignments
+                  UNION ALL SELECT port_id,sample_id,usage,branch FROM branch_assignments) w
+            JOIN ports p ON p.id=w.port_id JOIN samples s ON s.id=w.sample_id
+            ORDER BY p.board,p.y,p.x,w.branch""").fetchall()
+        mismatches = []
+        for row in rows:
+            kind = stored_line_type(row["kind"].strip())
+            usage = stored_line_type(row["usage"].strip())
+            if not usage or (usage != kind and (kind, usage) != ("XY/Z", "Z")):
+                mismatches.append(row)
+        return len(rows), mismatches
+
+    def set_occupied(self, port_id, occupied):
+        self.set_port_status(port_id, "occupied" if occupied else "")
+
+    def set_port_status(self, port_id, status):
+        self.set_ports_status([port_id], status)
+
+    @undoable("批量修改端口状态")
+    def set_ports_status(self, port_ids, status):
+        if status not in ("", "occupied", "damaged"): raise ValueError("不支持的端口状态")
+        for port_id in port_ids: self.port(port_id)
+        with self.db:
+            for port_id in port_ids:
+                if status:
+                    self.db.execute("INSERT OR REPLACE INTO meta VALUES (?,?)", (f"occupied:{port_id}", status))
+                else:
+                    self.db.execute("DELETE FROM meta WHERE key=?", (f"occupied:{port_id}",))
+
+    def branch_marks(self, port_id):
+        row = self.db.execute("SELECT value FROM meta WHERE key=?", (f"occupied_branches:{port_id}",)).fetchone()
+        return set(json.loads(row[0])) if row else set()
+
+    @undoable("修改开关分支占用")
+    def set_branch_occupied(self, port_id, branch, occupied):
+        self._check_available(port_id)
+        if branch not in self.circuit(port_id).get("switch", []): raise ValueError("开关分支不存在")
+        marked = self.branch_marks(port_id)
+        if occupied: marked.add(branch)
+        else: marked.discard(branch)
+        with self.db:
+            if marked:
+                self.db.execute("INSERT OR REPLACE INTO meta VALUES (?,?)", (f"occupied_branches:{port_id}", json.dumps(sorted(marked), ensure_ascii=False)))
+            else:
+                self.db.execute("DELETE FROM meta WHERE key=?", (f"occupied_branches:{port_id}",))
+
+    def _check_available(self, port_id, branch=None):
+        if self.port(port_id)["manually_occupied"]:
+            raise ValueError("端口已手动标记为占用或损坏，请先取消标记")
+        if branch is not None and branch in self.branch_marks(port_id):
+            raise ValueError("分支已手动标记为占用，请先取消分支标记")
+
+    @undoable("修改占用端口图纸编号")
+    def set_occupied_drawing(self, port_id, branch, drawing):
+        port = self.port(port_id)
+        if port["manual_status"] == "damaged" or not (port["manually_occupied"] or port["sample_id"] or (branch and branch in self.branch_marks(port_id))):
+            raise ValueError("请先将端口标记为已占用")
+        if branch and branch not in self.circuit(port_id).get("switch", []):
+            raise ValueError("开关分支不存在")
+        values = json.loads(port["occupied_drawings"])
+        if drawing.strip(): values[branch or ""] = drawing.strip()
+        else: values.pop(branch or "", None)
+        with self.db:
+            if values:
+                self.db.execute("INSERT OR REPLACE INTO meta VALUES (?,?)", (f"occupied_drawing:{port_id}", json.dumps(values, ensure_ascii=False)))
+            else:
+                self.db.execute("DELETE FROM meta WHERE key=?", (f"occupied_drawing:{port_id}",))
 
     def circuit(self, port_id):
         row = self.db.execute("SELECT circuit_json FROM port_circuits WHERE port_id=?", (port_id,)).fetchone()
@@ -233,21 +355,22 @@ class FridgeStore:
             JOIN samples s ON s.id=b.sample_id WHERE port_id=? ORDER BY branch""", (port_id,)).fetchall()
 
     def _set_circuit(self, port_id, circuit, transfer_branch=None):
-        self.port(port_id)
+        self._check_available(port_id)
         components = circuit.get("components", [])
         branches = [str(b).strip() for b in circuit.get("switch", [])]
         if any(not b for b in branches) or len(set(branches)) != len(branches):
             raise ValueError("开关分支名称不能为空或重复")
-        used = {r["branch"] for r in self.branch_assignments(port_id)}
+        used = {r["branch"] for r in self.branch_assignments(port_id)} | self.branch_marks(port_id)
         if not used.issubset(branches):
             raise ValueError("已有分配的开关分支不能移除，请先解除分配")
         direct = self.db.execute("SELECT * FROM assignments WHERE port_id=?", (port_id,)).fetchone()
         if direct and branches:
             if transfer_branch not in branches:
                 raise ValueError("该端口已有样品，请选择其所属开关分支")
-            self.db.execute("INSERT INTO branch_assignments VALUES (?,?,?,?,?,?,?,?,?)",
+            self._check_available(port_id, transfer_branch)
+            self.db.execute("INSERT INTO branch_assignments (port_id,branch,sample_id,usage,pin,drawing,devices_json,notes,legacy_json,box_port_id) VALUES (?,?,?,?,?,?,?,?,?,?)",
                             (port_id, transfer_branch, direct["sample_id"], direct["usage"], direct["pin"],
-                             direct["drawing"], direct["devices_json"], direct["notes"], direct["legacy_json"]))
+                             direct["drawing"], direct["devices_json"], direct["notes"], direct["legacy_json"], direct["box_port_id"]))
             self.db.execute("DELETE FROM assignments WHERE port_id=?", (port_id,))
         data = dict(circuit, components=components, switch=branches)
         encoded = json.dumps(data, ensure_ascii=False, allow_nan=False)
@@ -269,6 +392,7 @@ class FridgeStore:
     def preset_preview(self):
         result = []
         for p in self.ports():
+            if p["manually_occupied"]: continue
             template = self.db.execute("SELECT value FROM meta WHERE key=?", (f"board_template:{p['board']}",)).fetchone()
             desired = preset_for(template[0] if template else p["board"], p["number"])
             if desired is not None:
@@ -380,42 +504,64 @@ class FridgeStore:
 
     @undoable("删除端口")
     def delete_port(self, port_id):
+        self._check_available(port_id)
+        if self.branch_marks(port_id): raise ValueError("请先取消分支占用标记")
         with self.db:
+            self.db.execute("DELETE FROM meta WHERE key=?", (f"occupied_drawing:{port_id}",))
+            self.db.execute("DELETE FROM meta WHERE key=?", (f"occupied_branches:{port_id}",))
             self.db.execute("DELETE FROM ports WHERE id=?", (port_id,))
 
     @undoable("分配端口")
-    def assign(self, port_id, sample_id, pin="", drawing="", devices=None, notes="", usage=None, *, branch=None):
-        row = self.port(port_id)
-        branches = self.circuit(port_id).get("switch", [])
-        if branches and branch not in branches or not branches and branch is not None:
-            raise ValueError("请选择有效的开关分支")
-        previous = (self.db.execute("SELECT * FROM branch_assignments WHERE port_id=? AND branch=?", (port_id, branch)).fetchone()
-                    if branch is not None else self.db.execute("SELECT * FROM assignments WHERE port_id=?", (port_id,)).fetchone())
-        if previous and previous["sample_id"] != sample_id:
-            raise ValueError("端口已分配给其他样品，请先解除分配")
-        available = {d["id"]: d for d in self.sample_devices(sample_id)}
-        if previous:
-            for device in json.loads(previous["devices_json"]):
-                available.setdefault(device["id"], device)
-        ids = devices or []
-        if any(i not in available for i in ids):
-            raise ValueError("关联器件不属于该样品")
-        legacy = previous["legacy_json"] if previous else "{}"
+    def assign(self, port_id, sample_id, pin="", drawing="", devices=None, notes="", usage=None,
+               *, branch=None, box_port_id=None):
+        self._check_available(port_id, branch)
         with self.db:
-            if branch is not None:
-                self.db.execute("""INSERT INTO branch_assignments VALUES (?,?,?,?,?,?,?,?,?)
-                    ON CONFLICT(port_id,branch) DO UPDATE SET sample_id=excluded.sample_id,usage=excluded.usage,
-                    pin=excluded.pin,drawing=excluded.drawing,devices_json=excluded.devices_json,notes=excluded.notes""",
-                    (port_id, branch, sample_id, usage or row["kind"], pin, drawing,
-                     json.dumps([available[i] for i in ids], ensure_ascii=False), notes, legacy))
+            self.db.execute("BEGIN IMMEDIATE")
+            row = self.port(port_id)
+            branches = self.circuit(port_id).get("switch", [])
+            if branches and branch not in branches or not branches and branch is not None:
+                raise ValueError("请选择有效的开关分支")
+            previous = (self.db.execute("SELECT * FROM branch_assignments WHERE port_id=? AND branch=?", (port_id, branch)).fetchone()
+                        if branch is not None else self.db.execute("SELECT * FROM assignments WHERE port_id=?", (port_id,)).fetchone())
+            if previous and previous["sample_id"] != sample_id:
+                raise ValueError("端口已分配给其他样品，请先解除分配")
+            if box_port_id is not None:
+                if not previous or previous["box_port_id"] != box_port_id:
+                    if not any(p["id"] == box_port_id for p in self.sample_box_ports(sample_id)):
+                        raise ValueError("请选择该样品的有效样品盒接口")
+                for existing in self.box_connections(sample_id, box_port_id):
+                    if (existing["id"], existing["branch"]) != (port_id, branch):
+                        suffix = f" · 分支 {existing['branch']}" if existing["branch"] is not None else ""
+                        raise ValueError(f"该接口已接到 {existing['board']} 盘 {existing['number']}{suffix}，请先解除分配")
+                saved = previous["devices_json"] if previous else "[]"
+                pin = previous["pin"] if previous else ""
             else:
-                self.db.execute("""INSERT INTO assignments VALUES (?,?,?,?,?,?,?,?)
+                available = {d["id"]: d for d in self.sample_devices(sample_id)}
+                if previous:
+                    for device in json.loads(previous["devices_json"]):
+                        available.setdefault(device["id"], device)
+                ids = devices or []
+                if any(i not in available for i in ids):
+                    raise ValueError("关联器件不属于该样品")
+                saved = json.dumps([available[i] for i in ids], ensure_ascii=False)
+            legacy = previous["legacy_json"] if previous else "{}"
+            values = (sample_id, usage or row["kind"], pin, drawing, saved, notes, legacy, box_port_id)
+            if branch is not None:
+                self.db.execute("""INSERT INTO branch_assignments (port_id,branch,sample_id,usage,pin,drawing,devices_json,notes,legacy_json,box_port_id)
+                    VALUES (?,?,?,?,?,?,?,?,?,?)
+                    ON CONFLICT(port_id,branch) DO UPDATE SET sample_id=excluded.sample_id,usage=excluded.usage,
+                    pin=excluded.pin,drawing=excluded.drawing,devices_json=excluded.devices_json,notes=excluded.notes,
+                    box_port_id=excluded.box_port_id""", (port_id, branch, *values))
+            else:
+                self.db.execute("""INSERT INTO assignments (port_id,sample_id,usage,pin,drawing,devices_json,notes,legacy_json,box_port_id)
+                VALUES (?,?,?,?,?,?,?,?,?)
                 ON CONFLICT(port_id) DO UPDATE SET sample_id=excluded.sample_id,usage=excluded.usage,pin=excluded.pin,
-                drawing=excluded.drawing,devices_json=excluded.devices_json,notes=excluded.notes""",
-                (port_id, sample_id, usage or row["kind"], pin, drawing, json.dumps([available[i] for i in ids], ensure_ascii=False), notes, legacy))
+                drawing=excluded.drawing,devices_json=excluded.devices_json,notes=excluded.notes,
+                box_port_id=excluded.box_port_id""", (port_id, *values))
 
     @undoable("解除分配")
     def unassign(self, port_id, branch=None):
+        self._check_available(port_id, branch)
         with self.db:
             if branch is None:
                 self.db.execute("DELETE FROM assignments WHERE port_id=?", (port_id,))
@@ -440,8 +586,8 @@ class FridgeStore:
                     mismatch = False
                 port = None if mismatch else ports.get((board, number))
                 branches = self.circuit(port["id"]).get("switch", []) if port else []
-                free = set(branches) - {r["branch"] for r in self.branch_assignments(port["id"])} if branches else set()
-                reason = ("未匹配盘号／端口" if not port else "请选择开关分支" if free else
+                free = set(branches) - {r["branch"] for r in self.branch_assignments(port["id"])} - self.branch_marks(port["id"]) if branches else set()
+                reason = ("未匹配盘号／端口" if not port else "端口已手动标记为占用或损坏" if port["manually_occupied"] else "请选择开关分支" if free else
                           "端口已占用" if port["sample_id"] or branches else "可迁移")
                 devices = [dict(r) for r in db.execute("""SELECT d.id,d.label,d.kind FROM devices d
                     JOIN wiring_assignments a ON a.device_id=d.id WHERE a.line_id=?""", (line["id"],))]
@@ -463,6 +609,7 @@ class FridgeStore:
         for item in selected:
             target = line_ports[item["line"]["id"]]
             item["port_id"], item["branch"] = target if isinstance(target, (tuple, list)) else (target, None)
+            self._check_available(item["port_id"], item["branch"])
             branches = self.circuit(item["port_id"]).get("switch", [])
             if branches and item["branch"] not in branches or not branches and item["branch"] is not None:
                 raise ValueError("请选择有效的开关分支")
@@ -501,9 +648,9 @@ class FridgeStore:
                     values = (sample_id, line["line_type"], detail.get("sample_pin", ""), detail.get("drawing_label", ""),
                               json.dumps(devices, ensure_ascii=False), line["notes"], legacy)
                     if item["branch"] is None:
-                        self.db.execute("INSERT INTO assignments VALUES (?,?,?,?,?,?,?,?)", (item["port_id"], *values))
+                        self.db.execute("INSERT INTO assignments (port_id,sample_id,usage,pin,drawing,devices_json,notes,legacy_json) VALUES (?,?,?,?,?,?,?,?)", (item["port_id"], *values))
                     else:
-                        self.db.execute("INSERT INTO branch_assignments VALUES (?,?,?,?,?,?,?,?,?)", (item["port_id"], item["branch"], *values))
+                        self.db.execute("INSERT INTO branch_assignments (port_id,branch,sample_id,usage,pin,drawing,devices_json,notes,legacy_json) VALUES (?,?,?,?,?,?,?,?,?)", (item["port_id"], item["branch"], *values))
                     self.db.execute("DELETE FROM sampledb.wiring_lines WHERE id=?", (line["id"],))
         finally:
             self.db.execute("DETACH DATABASE sampledb")
@@ -513,12 +660,15 @@ class FridgeStore:
 
     def table_entries(self):
         headers = ["盘号", "端口", "端口类型", "开关分支", "线路用途", "占用状态", "样品", "样品引脚",
-                   "历史图纸编号 / 信号名称", "器件", "比特图纸编号", "低温线路", "备注"]
+                   "历史图纸编号 / 信号名称", "器件", "比特图纸编号", "低温线路", "备注",
+                   "样品盒接口", "接口编号来源", "接口信号", "接口方向", "连接状态", "手动占用标记", "占用接线目标图纸编号"]
         entries = []
+        box_cache = {}
         for p in self.ports():
             circuit = self.circuit(p["id"])
             branches = circuit.get("switch", [])
             assigned = {r["branch"]: r for r in self.branch_assignments(p["id"])}
+            marked = self.branch_marks(p["id"])
             components = "\n".join(" / ".join(str(v) for v in (c.get("stage"), c.get("kind"),
                 c.get("value") if c.get("value") is not None else "", c.get("unit"), c.get("mark"),
                 c.get("terminal"), c.get("notes")) if v not in (None, ""))
@@ -526,15 +676,18 @@ class FridgeStore:
             for branch in branches or [None]:
                 row = assigned.get(branch) if branch is not None else p
                 sample_id = row["sample_id"] if row else None
-                saved = json.loads(row["devices_json"] or "[]") if row else []
-                devices = self.resolve_devices(sample_id, saved) if sample_id else []
+                box, status, devices = self.resolve_assignment(row, box_cache) if sample_id else (None, "", [])
                 numbers = ", ".join(f"{d['label']}: {d.get('drawing_number', '') or '未填写'}"
                     + (f"（{d['status']}）" if d.get("status") else "") for d in devices if d.get("kind") == "qubit")
                 values = [p["board"], p["number"], display_line_type(p["kind"]), branch or "",
-                          display_line_type(row["usage"] or "") if row else "", "已分配" if sample_id else "空闲",
+                          display_line_type(row["usage"] or "") if row else "", "已损坏" if p["manual_status"] == "damaged" else "已占用" if p["manually_occupied"] or sample_id or branch in marked else "未分配",
                           ((row["sample_name"] or "") + ("（样品不可用）" if sample_id and not self.sample_path(sample_id).is_file() else "")) if row else "", row["pin"] or "" if row else "",
                           row["drawing"] or "" if row else "", ", ".join(d["label"] for d in devices), numbers,
-                          components, row["notes"] or "" if row else ""]
+                          components, row["notes"] or "" if row else "",
+                          box["number"] if box else "", box_number_source(box) if box else "",
+                          box["signal_name"] if box else "", BOX_ROLES.get(box["role"], "") if box else "", status,
+                          ("已损坏" if p["manual_status"] == "damaged" else "已占用") if p["manually_occupied"] else "分支已占用" if branch in marked else "",
+                          json.loads(p["occupied_drawings"]).get(branch or "", json.loads(p["occupied_drawings"]).get("", "")) if p["manual_status"] != "damaged" and (p["manually_occupied"] or sample_id or branch in marked) else ""]
                 entries.append((p["id"], branch, values))
         return headers, entries
 

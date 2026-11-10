@@ -167,7 +167,7 @@ def test_embedded_overview_and_separate_undo(tmp_path):
     fridge_path = tmp_path / "fridge.qfridge"
     FridgeStore.create(fridge_path, "测试制冷机").close()
     window = gui.MainWindow(); window.show(); app.processEvents()
-    window.navigation.setCurrentRow(2); app.processEvents()
+    window.tabs.setCurrentWidget(window.fridge_page); app.processEvents()
     preview = window.fridge_panel
     assert preview.preview and preview.is_overview() and preview.table.rowCount() == 181
     assert not any(b.isEnabled() for b in preview.port_buttons)
@@ -180,7 +180,7 @@ def test_embedded_overview_and_separate_undo(tmp_path):
     window.store.add_device("qubit", "fixed_transmon", "Q1", 2, 0)
     window._open_fridge_path(str(fridge_path)); app.processEvents()
     panel = window.fridge_panel
-    assert window.tabs.currentIndex() == 2 and panel.window() is window and panel.is_overview()
+    assert window.tabs.currentWidget() is window.fridge_page and panel.window() is window and panel.is_overview()
     assert not any(b.isEnabled() for b in panel.port_buttons)
     item = next(item for item in panel.scene.items() if hasattr(item, "port") and item.port["board"] == "A")
     assert not item.flags() & QGraphicsItem.GraphicsItemFlag.ItemIsMovable

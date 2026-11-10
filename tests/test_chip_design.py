@@ -72,6 +72,8 @@ def test_v3_upgrade_preserves_parameters_and_original_backup(tmp_path):
         qubit = store.add_device("qubit", "fixed_transmon", "Q1", 0, 0)
         store.set_parameter(qubit, "qubit.f01", 5.2)
         with store.db:
+            store.db.execute("DROP TABLE sample_box_bindings")
+            store.db.execute("DROP TABLE sample_box_ports")
             store.db.execute("DROP TABLE readout_links")
             store.db.execute("DROP TABLE wiring_details")
             store.db.execute("DROP TABLE design_markers")

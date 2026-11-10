@@ -1,5 +1,6 @@
 """Physical chip layout viewer with persistent device name anchors."""
 
+from html import escape
 from pathlib import Path
 
 from PySide6.QtCore import QPoint, QPointF, QRectF, Qt, Signal
@@ -13,6 +14,8 @@ from PySide6.QtWidgets import (
 from .tex_labels import tex_to_html
 from .device_types import DEVICE_NAMES, DEVICE_COLORS
 from .attachment_ui import clipboard_payload
+from .graphics_interaction import RightPanMixin
+from .theme import custom_device_colors
 
 
 IMAGE_FILTER = "设计图 (*.png *.jpg *.jpeg *.bmp *.tif *.tiff *.webp);;所有文件 (*)"
@@ -36,7 +39,7 @@ class DesignMarker(QGraphicsObject):
     activated = Signal(str, QPoint)
     moved = Signal(str, float, float)
 
-    def __init__(self, row, image_item, editing):
+    def __init__(self, row, image_item, editing, custom_colors):
         super().__init__(image_item)
         self.device_id = row["device_id"]
         self.kind = row["kind"]
@@ -47,17 +50,24 @@ class DesignMarker(QGraphicsObject):
         font = QFont(); font.setPixelSize(14); font.setBold(True)
         self.document.setDefaultFont(font)
         self.document.setDocumentMargin(0)
-        self.update_label(row["label"])
+        self.update_label(row, custom_colors)
         rect = image_item.boundingRect()
         self.setPos(row["x"] * rect.width(), row["y"] * rect.height())
         self.set_editing(editing)
 
-    def update_label(self, label):
+    def update_label(self, row, custom_colors):
         self.prepareGeometryChange()
-        self.document.setHtml(f'<span style="color:white">{tex_to_html(label)}</span>')
+        label = row["label"]
+        subtype = row["subtype"] if self.kind == "custom" else ""
+        self.color = QColor(custom_colors.get(subtype, DEVICE_COLORS[self.kind]))
+        text_color = "#15181E" if subtype and self.color.lightnessF() > .48 else "white"
+        text = tex_to_html(label)
+        if subtype:
+            text += f'<br><span style="font-size:11px">{escape(subtype)}</span>'
+        self.document.setHtml(f'<span style="color:{text_color}">{text}</span>')
         size = self.document.size()
         self.badge = QRectF(9, -size.height() - 12, size.width() + 16, size.height() + 8)
-        self.setToolTip(f"{DEVICE_NAMES[self.kind]} · {label}")
+        self.setToolTip(f"{subtype or DEVICE_NAMES[self.kind]} · {label}")
         self.update()
 
     def set_editing(self, editing):
@@ -70,9 +80,9 @@ class DesignMarker(QGraphicsObject):
 
     def paint(self, painter, option, widget=None):
         painter.setRenderHint(QPainter.RenderHint.Antialiasing)
-        color = QColor("#f59e0b" if self.isSelected() else DEVICE_COLORS[self.kind])
-        painter.setPen(QPen(QColor("white"), 2))
-        painter.setBrush(color)
+        highlight = self.isSelected()
+        painter.setPen(QPen(QColor("#f59e0b" if highlight and self.kind == "custom" else "white"), 2))
+        painter.setBrush(QColor("#f59e0b") if highlight and self.kind != "custom" else self.color)
         if self.kind == "readout":
             painter.drawRoundedRect(QRectF(-6, -3, 12, 6), 2, 2)
         elif self.kind == "filter":
@@ -86,21 +96,28 @@ class DesignMarker(QGraphicsObject):
 
     def mousePressEvent(self, event):
         self.start_pos = self.pos()
+        self._other_movable = []
+        if self.isSelected():
+            for item in self.scene().selectedItems():
+                if item is not self and item.flags() & QGraphicsItem.GraphicsItemFlag.ItemIsMovable:
+                    self._other_movable.append(item); item.setFlag(QGraphicsItem.GraphicsItemFlag.ItemIsMovable, False)
         super().mousePressEvent(event)
 
     def mouseReleaseEvent(self, event):
         super().mouseReleaseEvent(event)
+        for item in self._other_movable:
+            item.setFlag(QGraphicsItem.GraphicsItemFlag.ItemIsMovable, True)
         if self.editing and self.pos() != self.start_pos:
             rect = self.parentItem().boundingRect()
             x = max(0, min(1, self.pos().x() / rect.width()))
             y = max(0, min(1, self.pos().y() / rect.height()))
             self.setPos(x * rect.width(), y * rect.height())
             self.moved.emit(self.device_id, x, y)
-        else:
+        elif not event.modifiers() & Qt.KeyboardModifier.ControlModifier:
             self.activated.emit(self.device_id, event.screenPos())
 
 
-class DesignView(QGraphicsView):
+class DesignView(RightPanMixin, QGraphicsView):
     placed = Signal(float, float)
 
     def __init__(self):
@@ -113,7 +130,7 @@ class DesignView(QGraphicsView):
         self.marker_opacity = 1.0
         self.fitted = True
         self.setRenderHints(QPainter.RenderHint.Antialiasing | QPainter.RenderHint.SmoothPixmapTransform)
-        self.setDragMode(QGraphicsView.DragMode.ScrollHandDrag)
+        self.setDragMode(QGraphicsView.DragMode.RubberBandDrag)
         self.setTransformationAnchor(QGraphicsView.ViewportAnchor.AnchorUnderMouse)
 
     def set_image(self, image=None, angle=0):
@@ -133,7 +150,9 @@ class DesignView(QGraphicsView):
         self.design_scene.setSceneRect(self.image_item.sceneBoundingRect().adjusted(-80, -80, 80, 80))
         self.fit_image()
 
-    def sync_markers(self, rows):
+    def sync_markers(self, rows, custom_colors=None):
+        if custom_colors is None:
+            custom_colors = custom_device_colors(row["subtype"] for row in rows if row["kind"] == "custom")
         wanted = {row["device_id"] for row in rows}
         for ident in set(self.markers) - wanted:
             item = self.markers.pop(ident)
@@ -144,11 +163,11 @@ class DesignView(QGraphicsView):
             ident = row["device_id"]
             if ident in self.markers:
                 item = self.markers[ident]
-                item.update_label(row["label"])
+                item.update_label(row, custom_colors)
                 rect = self.image_item.boundingRect()
                 item.setPos(row["x"] * rect.width(), row["y"] * rect.height())
             else:
-                self.markers[ident] = DesignMarker(row, self.image_item, self.editing)
+                self.markers[ident] = DesignMarker(row, self.image_item, self.editing, custom_colors)
             self.markers[ident].setOpacity(self.marker_opacity)
 
     def set_marker_opacity(self, opacity):
@@ -291,8 +310,10 @@ class ChipDesignPanel(QWidget):
     def refresh_markers(self, *_):
         chosen = self.devices.currentData()
         rows = self.store.design_markers() if self.store else []
+        devices = self.store.devices() if self.store else []
         if self.view.image_item:
-            self.view.sync_markers(rows)
+            colors = custom_device_colors(device["subtype"] for device in devices if device["kind"] == "custom")
+            self.view.sync_markers(rows, colors)
             for item in self.view.markers.values():
                 if not getattr(item, "connected", False):
                     item.activated.connect(self.activate_marker)
@@ -302,7 +323,6 @@ class ChipDesignPanel(QWidget):
         marked = {row["device_id"] for row in rows}
         self.devices.blockSignals(True)
         self.devices.clear()
-        devices = self.store.devices() if self.store else []
         if self.store:
             for device in devices:
                 if not self.readout_visible and device["kind"] in ("readout", "filter"):
@@ -310,7 +330,8 @@ class ChipDesignPanel(QWidget):
                 if self.device_kind.currentData() and device["kind"] != self.device_kind.currentData():
                     continue
                 status = "已标注" if device["id"] in marked else "未标注"
-                self.devices.addItem(f"{DEVICE_NAMES[device['kind']]} · {device['label']} · {status}", device["id"])
+                kind = device["subtype"] if device["kind"] == "custom" else DEVICE_NAMES[device["kind"]]
+                self.devices.addItem(f"{kind} · {device['label']} · {status}", device["id"])
         self.devices.setCurrentIndex(max(0, self.devices.findData(chosen)))
         self.devices.blockSignals(False)
         total = len(devices)
@@ -332,8 +353,8 @@ class ChipDesignPanel(QWidget):
         self.remove_marker_button.setEnabled(has_image and editing and chosen in self.view.markers)
         for ident, item in self.view.markers.items():
             item.setSelected(ident == chosen)
-        self.hint.setText("选择器件后点击设计图放置或重新定位；拖动标注调整位置。拖动空白平移，滚轮缩放。"
-                          if editing else "查看模式 · 点击标注查看器件参数；拖动平移，滚轮缩放。开启“编辑标注”后登记位置。")
+        self.hint.setText("选择器件后点击设计图放置或重新定位；拖动标注调整位置。右键拖动平移，滚轮缩放。"
+                          if editing else "查看模式 · 左键点选或框选标注；右键拖动平移，滚轮缩放。开启“编辑标注”后登记位置。")
 
     def set_editing(self, editing):
         self.view.set_editing(editing)

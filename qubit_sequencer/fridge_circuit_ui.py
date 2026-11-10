@@ -9,6 +9,8 @@ from PySide6.QtWidgets import (QCheckBox, QComboBox, QDialog, QDialogButtonBox, 
     QTableWidget, QTableWidgetItem, QVBoxLayout)
 
 from .fridge_presets import STAGES
+from .theme import UI_COLORS
+from .ui_icons import icon
 
 
 def component_text(component):
@@ -37,10 +39,11 @@ class CircuitDialog(QDialog):
         self.rows = QTableWidget(0, 7); self.rows.setHorizontalHeaderLabels(["温级", "类别", "数值", "单位", "标记 / 编号", "端点", "备注"])
         self.rows.horizontalHeader().setStretchLastSection(True); layout.addWidget(self.rows, 1)
         actions = QHBoxLayout(); layout.addLayout(actions)
-        for label, callback in (("新增行", self.add_row), ("删除行", self.remove_row),
-                                ("上移", lambda: self.move_row(-1)), ("下移", lambda: self.move_row(1)),
-                                ("从旧记录导入", self.import_legacy), ("查看导入旧资料", self.view_imported)):
-            button = QPushButton(label); button.clicked.connect(callback); actions.addWidget(button)
+        color = UI_COLORS[getattr(parent, "theme", "light")]["text"]
+        for label, callback, symbol in (("新增行", self.add_row, "new"), ("删除行", self.remove_row, "delete"),
+                                ("上移", lambda: self.move_row(-1), "up"), ("下移", lambda: self.move_row(1), "down"),
+                                ("从旧记录导入", self.import_legacy, "open"), ("查看导入旧资料", self.view_imported, "history")):
+            button = QPushButton(label); button.setIcon(icon(symbol, color)); button.clicked.connect(callback); actions.addWidget(button)
         actions.addStretch()
         self.enable_switch = QCheckBox("启用微波开关")
         self.branches = QLineEdit(); self.branches.setPlaceholderText("分支编号，以逗号分隔，例如 1,2,3,4,5,6")

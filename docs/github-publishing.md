@@ -7,15 +7,15 @@
 1. 选择仓库所有者、仓库名称、公开/私有属性及源码许可。
 2. 本机 Git Credential Manager 需要已登录该 GitHub 账号。脚本只在内存中使用登录凭据，不会打印或保存到项目中。
 3. 确认 `.gitignore` 已排除实际芯片项目、恢复的数据、缓存和 Windows 构建目录；提交准备好的源码。
-4. 确认 `output/release/` 中的最新发布包已经生成，且 `docs/releases/v0.2.1.md` 与实际版本一致。
+4. 确认 `output/release/` 中的最新发布包已经生成，并准备对应版本的 `docs/releases/v版本.md`。
 5. 在项目根目录执行：
 
 ```powershell
 python scripts/publish_github.py --check-auth
-python scripts/publish_github.py --repository QubitSequencer --visibility private
+python scripts/publish_github.py --owner Wonder0225 --repository QubitSequencer --visibility public
 ```
 
-当前使用私有仓库。公开发布时将 `private` 改为 `public`；已有仓库的可见性需先在 GitHub 设置中更改，脚本不会自动切换。组织仓库可增加 `--owner 组织名称`，需要账号有相应权限。
+现有仓库为公开仓库。发布其他仓库时，`--visibility` 应与其可见性一致。`--owner` 用于指定仓库所有者，发布账号需具备相应权限。
 
 脚本创建仓库，推送 `main` 和版本标签，然后先创建草稿 Release；上传 Windows ZIP、使用说明 PDF 和 `SHA256SUMS.txt` 并核对结果后发布。已有仓库中的不同提交和已发布的同名版本不会被覆盖。
 

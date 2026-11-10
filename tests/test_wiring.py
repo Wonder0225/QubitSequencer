@@ -107,6 +107,8 @@ def test_v4_upgrade_preserves_old_line_and_backup(tmp_path):
         line = store.add_line("读出", "OLD-DR", "A1", "OLD channel", "旧备注", [q])
         record = store.set_parameter(q, "qubit.f01", 4.7)
         with store.db:
+            store.db.execute("DROP TABLE sample_box_bindings")
+            store.db.execute("DROP TABLE sample_box_ports")
             store.db.execute("DROP TABLE readout_links")
             store.db.execute("DROP TABLE wiring_details")
             store.db.execute("PRAGMA user_version=4")
@@ -145,7 +147,7 @@ def test_editor_tables_validation_undo_and_main_filters(tmp_path):
         dialog.components.item(1, 3).setText("17")
         assert dialog.details()["components"][1]["value"] == 17
         dialog.reject()
-        window.tabs.setCurrentIndex(2); window.wiring_search.setText("DEMO-SW")
+        window.tabs.setCurrentWidget(window.fridge_page); window.wiring_search.setText("DEMO-SW")
         visible = [r for r in range(window.wiring_table.rowCount()) if not window.wiring_table.isRowHidden(r)]
         assert len(visible) == 1
         window.wiring_table.selectRow(visible[0]); app.processEvents()

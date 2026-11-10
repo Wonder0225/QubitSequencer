@@ -87,13 +87,14 @@ def main() -> None:
                 _save(window, pictures / main_name)
                 preview = "surface_d3_complete_preview.png" if mode == "light" else "surface_d3_complete_dark_preview.png"
                 _save(window, example.with_name(preview))
-                for index, name in ((1, "data-table"), (2, "wiring"), (3, "history")):
-                    window.tabs.setCurrentIndex(index)
+                for page, name in ((window.data_page, "data-table"), (window.fridge_page, "wiring"),
+                                   (window.history_page, "history")):
+                    window.tabs.setCurrentWidget(page)
                     _settle(app)
                     window.statusBar().clearMessage()
                     suffix = "" if mode == "light" else "-dark"
                     _save(window, pictures / f"{name}{suffix}.png")
-                    if index == 1:
+                    if page is window.data_page:
                         table_name = "surface_d3_complete_table_vertical.png" if mode == "light" else "surface_d3_complete_dark_table_vertical.png"
                         _save(window, example.with_name(table_name))
                 window.tabs.setCurrentIndex(0)

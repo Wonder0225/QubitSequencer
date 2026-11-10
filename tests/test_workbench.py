@@ -15,9 +15,10 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 from PySide6.QtCore import QPoint, QSettings, Qt
 from PySide6.QtGui import QContextMenuEvent
 from PySide6.QtTest import QTest
-from PySide6.QtWidgets import QApplication, QDialog, QMessageBox, QStackedWidget, QToolButton
+from PySide6.QtWidgets import QApplication, QDialog, QMessageBox, QToolButton
 
 from qubit_sequencer import gui
+from qubit_sequencer.fridge_store import FridgeStore
 from qubit_sequencer.storage import ChipStore
 
 
@@ -110,26 +111,118 @@ class WorkbenchTests(unittest.TestCase):
 
     def test_navigation_keeps_global_working_point_visible(self):
         window = self.window
-        self.assertIsInstance(window.tabs, QStackedWidget)
-        self.assertEqual(window.tabs.count(), 4)
-        self.assertEqual(window.navigation.count(), 4)
+        self.assertEqual(window.tabs.count(), 5)
+        self.assertEqual(window.navigation.count(), 5)
+        self.assertEqual(window.navigation.item(1).text(), "样品盒构型")
         window.point_combo.setCurrentText("idle")
-        for page in range(4):
+        for page in range(window.tabs.count()):
             with self.subTest(page=page):
                 window.navigation.setCurrentRow(page)
                 self.process_events()
                 self.assertEqual(window.tabs.currentIndex(), page)
                 self.assertTrue(window.point_combo.isVisible())
                 self.assertEqual(window.point_combo.currentText(), "idle")
-                window.tabs.setCurrentIndex((page + 1) % 4)
+                window.tabs.setCurrentIndex((page + 1) % window.tabs.count())
                 self.process_events()
-                self.assertEqual(window.navigation.currentRow(), (page + 1) % 4)
+                self.assertEqual(window.navigation.currentRow(), (page + 1) % window.tabs.count())
+
+    def test_columns_keep_page_state_and_restore_layout(self):
+        window = self.window
+        window.multi_column_action.trigger()
+        window.navigation.setCurrentRow(2)
+        self.process_events()
+        splitter = window.tabs.splitter
+        original_sizes = splitter.sizes()
+        splitter.moveSplitter(original_sizes[0] - 40, 1)
+        self.assertNotEqual(splitter.sizes(), original_sizes)
+        window.filter_edit.setText("Q_beta")
+        window.navigation.setCurrentRow(4)
+        window.navigation.setCurrentRow(1)
+        window.navigation.setCurrentRow(3)
+        self.process_events()
+        self.assertEqual(window.tabs.visible_indices(), (0, 2, 4, 1, 3))
+        self.assertTrue(all(window.tabs.widget(i).isVisible() for i in range(5)))
+        self.assertLessEqual(window.minimumSizeHint().width(), window.width())
+        window.tabs.columns[2][3].click()
+        window.tabs.columns[4][5].click()
+        self.assertEqual(window.tabs.visible_indices(), (2, 0, 1, 3))
+        window.multi_column_action.trigger()
+        self.assertEqual(window.tabs.visible_indices(), (3,))
+        window.multi_column_action.trigger()
+        self.assertEqual(window.tabs.visible_indices(), (2, 0, 1, 3))
+        self.assertEqual(window.filter_edit.text(), "Q_beta")
+        widths = window.tabs.layout_state()[1]
+        window.close()
+        # The settings backend may return a list of strings after a process restart.
+        self.settings.setValue("layout/workspaceWidths", [str(width) for width in widths])
+        reopened = self.make_window()
+        self.assertFalse(reopened.multi_column_action.isChecked())
+        self.assertEqual(reopened.tabs.visible_indices(), (3,))
+        self.assertIs(reopened.tabs.currentWidget(), reopened.fridge_page)
+        reopened.multi_column_action.trigger()
+        self.assertEqual(reopened.tabs.visible_indices(), (2, 0, 1, 3))
+        self.assertEqual(reopened.tabs.layout_state()[1], widths)
+        reopened.multi_column_action.trigger()
+        reopened.navigation.setCurrentRow(4)
+        reopened.multi_column_action.trigger()
+        self.assertEqual(reopened.tabs.visible_indices(), (2, 0, 1, 3))
+        self.assertIs(reopened.tabs.currentWidget(), reopened.data_page)
+
+    def test_workspace_restores_projects_and_views_on_regular_launch(self):
+        window = self.window
+        fridge_path = self.path.with_suffix(".qfridge")
+        FridgeStore.create(fridge_path, "制冷机").close()
+        window._open_fridge_path(str(fridge_path))
+        window.point_combo.setCurrentText("idle")
+        window._show_chip_view(1)
+        window.fridge_panel.open_board("F")
+        window.fridge_panel.views.setCurrentIndex(1)
+        window.close()
+
+        reopened = gui.MainWindow()
+        try:
+            self.assertEqual(reopened.store.path, self.path)
+            self.assertEqual(reopened.fridge_panel.store.path, fridge_path)
+            self.assertFalse(reopened.fridge_panel.preview)
+            self.assertIs(reopened.tabs.currentWidget(), reopened.fridge_page)
+            self.assertFalse(reopened.tabs.multicolumn)
+            self.assertEqual(reopened.point_combo.currentText(), "idle")
+            self.assertEqual(reopened.chip_views.currentIndex(), 1)
+            self.assertEqual(reopened.fridge_panel.board.currentData(), "F")
+            self.assertEqual(reopened.fridge_panel.views.currentIndex(), 1)
+        finally:
+            reopened.close()
+
+    def test_columns_route_undo_to_focused_project(self):
+        window = self.window
+        path = Path(self.tmp.name) / "columns.qfridge"
+        fridge = FridgeStore.create(path, "多栏测试")
+        fridge.close()
+        window.multi_column_action.trigger()
+        window._open_fridge_path(str(path))
+        panel = window.fridge_panel
+        panel.open_board("A")
+        port = panel.store.ports()[0]
+        panel.store.save_port(port["id"], port["board"], "test-undo", port["x"], port["y"], port["kind"])
+        window.store.update_device(self.alpha, label="测试比特")
+        window.view.setFocus()
+        self.process_events()
+        self.assertIs(window.tabs.currentWidget(), window.topology_page)
+        QTest.keyClick(window.view, Qt.Key.Key_Z, Qt.KeyboardModifier.ControlModifier)
+        self.assertEqual(window.store.device(self.alpha)["label"], "Q_alpha")
+        self.assertEqual(panel.store.port(port["id"])["number"], "test-undo")
+        panel.graphics.setFocus()
+        self.process_events()
+        self.assertIs(window.tabs.currentWidget(), window.fridge_page)
+        QTest.keyClick(panel.graphics, Qt.Key.Key_Z, Qt.KeyboardModifier.ControlModifier)
+        self.assertEqual(panel.store.port(port["id"])["number"], port["number"])
 
     def test_canvas_modes_are_exclusive_and_leaving_canvas_clears_endpoint(self):
         window = self.window
         placement = window.add_component_button.menu().actions()
         self.assertEqual(placement, [window.place_action, window.place_coupler_action,
-                                     window.place_readout_action, window.place_filter_action])
+                                     window.place_readout_action, window.place_filter_action,
+                                     window.place_custom_action])
         actions = (*placement, window.connect_action)
         for chosen in actions:
             chosen.trigger()
@@ -383,7 +476,7 @@ class WorkbenchTests(unittest.TestCase):
         alpha_column = window._table_object_ids.index(self.alpha) + 1
         self.assertFalse(window.data_table.isRowHidden(frequency_row))
         self.assertAlmostEqual(float(window.data_table.item(frequency_row, alpha_column).text()), 5.7)
-        window.tabs.setCurrentIndex(3)
+        window.tabs.setCurrentWidget(window.history_page)
         self.process_events()
         points = {window.history_table.item(r, 6).text() for r in range(window.history_table.rowCount())}
         self.assertEqual(points, {"default", "idle"})
@@ -403,7 +496,7 @@ class WorkbenchTests(unittest.TestCase):
         window = self.window
         for title, needle, kind, ident in self.table_targets():
             with self.subTest(table=title):
-                window.tabs.setCurrentIndex(1)
+                window.tabs.setCurrentWidget(window.data_page)
                 window.table_kind.setCurrentText(title)
                 window.table_orientation.setCurrentIndex(window.table_orientation.findData("horizontal"))
                 window.filter_edit.setText(needle)
@@ -418,7 +511,7 @@ class WorkbenchTests(unittest.TestCase):
         window = self.window
         for title, needle, kind, ident in self.table_targets():
             with self.subTest(table=title):
-                window.tabs.setCurrentIndex(1)
+                window.tabs.setCurrentWidget(window.data_page)
                 window.table_kind.setCurrentText(title)
                 window.table_orientation.setCurrentIndex(window.table_orientation.findData("vertical"))
                 window.filter_edit.setText(needle)
@@ -428,7 +521,7 @@ class WorkbenchTests(unittest.TestCase):
                 window.data_table.cellDoubleClicked.emit(0, visible[0])
                 self.process_events()
                 self.assertEqual(window.selected, (kind, ident))
-        window.tabs.setCurrentIndex(1)
+        window.tabs.setCurrentWidget(window.data_page)
         window.table_kind.setCurrentText("比特")
         window.filter_edit.setText("顶点频率")
         visible_rows = [r for r in range(window.data_table.rowCount()) if not window.data_table.isRowHidden(r)]
@@ -444,10 +537,11 @@ class WorkbenchTests(unittest.TestCase):
         self.select_device(self.gamma)
         self.assertEqual(window.delete_action.shortcutContext(), Qt.ShortcutContext.WidgetShortcut)
         self.assertIn(window.delete_action, window.view.actions())
-        for page, focus in ((1, window.filter_edit), (2, window.wiring_table), (3, window.history_table)):
+        for page, focus in ((window.data_page, window.filter_edit), (window.fridge_page, window.wiring_table),
+                            (window.history_page, window.history_table)):
             with self.subTest(page=page), \
                  patch.object(QMessageBox, "question", return_value=QMessageBox.StandardButton.Yes) as confirm:
-                window.tabs.setCurrentIndex(page)
+                window.tabs.setCurrentWidget(page)
                 focus.setFocus()
                 QTest.keyClick(focus, Qt.Key.Key_Delete)
                 window.delete_selected()
@@ -508,7 +602,7 @@ class WorkbenchTests(unittest.TestCase):
 
     def test_wiring_actions_require_line_selection(self):
         window = self.window
-        window.tabs.setCurrentIndex(2)
+        window.tabs.setCurrentWidget(window.fridge_page)
         window.wiring_table.clearSelection()
         window.wiring_table.setCurrentCell(-1, -1)
         self.process_events()

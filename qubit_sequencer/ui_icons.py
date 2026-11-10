@@ -17,6 +17,12 @@ _SHAPES = {
     "backup": '<path d="M3 8h14v9H3z M2.5 4h15v4h-15z M8 11h4"/>',
     "export": '<path d="M10 12V2.5 M6.5 6 10 2.5 13.5 6 M3.5 11v6h13v-6"/>',
     "chip": '<rect x="5" y="5" width="10" height="10" rx="1.5"/><rect x="8" y="8" width="4" height="4" rx=".5"/><path d="M7 2v3 M13 2v3 M7 15v3 M13 15v3 M2 7h3 M2 13h3 M15 7h3 M15 13h3"/>',
+    "sample_box": (
+        '<path d="M6 2.5h8L17.5 6v8L14 17.5H6L2.5 14V6z"/>'
+        '<rect x="7.75" y="7.75" width="4.5" height="4.5" rx=".5"/>'
+        '<path d="M8.1 5.4h.1 M11.8 5.4h.1 M14.6 8.1v.1 M14.6 11.8v.1 '
+        'M8.1 14.6h.1 M11.8 14.6h.1 M5.4 8.1v.1 M5.4 11.8v.1"/>'
+    ),
     "table": '<rect x="2.5" y="3.5" width="15" height="13" rx="1"/><path d="M2.5 7.5h15 M2.5 12h15 M7.5 7.5v9"/>',
     "wiring": '<rect x="2" y="3" width="5" height="4" rx="1"/><rect x="13" y="13" width="5" height="4" rx="1"/><path d="M7 5h7v5H6v5h7"/>',
     "history": '<path d="M3 6a7 7 0 1 1-0.1 8 M3 2.5V6h3.5 M10 6v4l3 2"/>',
@@ -25,6 +31,7 @@ _SHAPES = {
     "coupler": '<circle cx="4.5" cy="10" r="2"/><circle cx="15.5" cy="10" r="2"/><path d="M6.5 10H8l1-3 2 6 1-3h1.5"/>',
     "readout": '<path d="M2 12h16 M6 4v8 M14 4v8"/><circle cx="6" cy="3" r="1"/><circle cx="14" cy="3" r="1"/>',
     "filter": '<rect x="5" y="4" width="10" height="12" rx="2"/><path d="M2 10h3 M15 10h3 M7 8h2l2 4h2"/>',
+    "custom": '<path d="M6.5 4h7l3.5 6-3.5 6h-7L3 10z M1.5 10H3 M17 10h1.5 M8 10h4 M10 8v4"/>',
     "connect": '<path d="m7.5 12.5 5-5 M6 11l-2 2a3.5 3.5 0 0 0 5 5l3-3a3.5 3.5 0 0 0 0-5 M14 9l2-2a3.5 3.5 0 0 0-5-5L8 5a3.5 3.5 0 0 0 0 5"/>',
     "fit": '<path d="M7 3H3v4 M13 3h4v4 M3 13v4h4 M17 13v4h-4"/><rect x="7" y="7" width="6" height="6" rx=".5"/>',
     "chevron": '<path d="m7 4 6 6-6 6"/>',
@@ -37,6 +44,12 @@ _SHAPES = {
     "undo": '<path d="M3 8h8a5 5 0 0 1 0 10 M7 4 3 8l4 4"/>',
     "redo": '<path d="M17 8H9a5 5 0 0 0 0 10 M13 4l4 4-4 4"/>',
     "help": '<circle cx="10" cy="10" r="7.5"/><path d="M7.5 7.5a2.5 2.5 0 1 1 4 2c-1 .6-1.5 1-1.5 2 M10 14.5v.1"/>',
+    "up": '<path d="M10 16V4 M5.5 8.5 10 4l4.5 4.5"/>',
+    "down": '<path d="M10 4v12 M5.5 11.5 10 16l4.5-4.5"/>',
+    "edit": '<path d="m3 14-.5 3.5L6 17l10-10-3-3z M11.5 5.5l3 3"/>',
+    "samples": '<circle cx="7" cy="6" r="3"/><path d="M2.5 17v-1a4.5 4.5 0 0 1 9 0v1z M13 3.5a3 3 0 0 1 0 5.5 M13 11a4 4 0 0 1 4.5 4v2h-3"/>',
+    "unlink": '<path d="M7 7 5 9a3.5 3.5 0 0 0 5 5l1-1 M13 13l2-2a3.5 3.5 0 0 0-5-5L9 7 M3 3l14 14"/>',
+    "overview": '<rect x="3" y="3" width="5" height="5" rx=".5"/><rect x="12" y="3" width="5" height="5" rx=".5"/><rect x="3" y="12" width="5" height="5" rx=".5"/><rect x="12" y="12" width="5" height="5" rx=".5"/>',
 }
 
 # Qt 6.8 corrected scaledPixmap to pass a logical size to custom engines.

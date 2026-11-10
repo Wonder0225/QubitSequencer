@@ -2,7 +2,7 @@ param([switch]$SkipLocalPublish)
 
 $ErrorActionPreference = 'Stop'
 $projectRoot = (Resolve-Path (Join-Path $PSScriptRoot '..')).Path
-$releaseVersion = '0.4.1'
+$releaseVersion = '0.4.3'
 $buildStamp = Get-Date -Format 'yyyyMMdd-HHmmss'
 $distPath = Join-Path $projectRoot "output/release/builds/$releaseVersion-$buildStamp"
 Set-Location -LiteralPath $projectRoot
@@ -53,6 +53,7 @@ Copy-Item -LiteralPath 'docs/cryostat-wiring.md' -Destination $release -Force
 Copy-Item -LiteralPath 'docs/qfridge-format-v1.md' -Destination $release -Force
 Copy-Item -LiteralPath 'docs/qfridge-format-v2.md' -Destination $release -Force
 Copy-Item -LiteralPath 'docs/qchip-format-v8.md' -Destination $release -Force
+Copy-Item -LiteralPath 'docs/sample-box-formats.md' -Destination $release -Force
 Copy-Item -LiteralPath 'docs/images' -Destination $release -Recurse -Force
 Copy-Item -LiteralPath 'output/pdf/user-guide.pdf' -Destination $release -Force
 Copy-Item -LiteralPath 'THIRD_PARTY_NOTICES.md' -Destination $release -Force
