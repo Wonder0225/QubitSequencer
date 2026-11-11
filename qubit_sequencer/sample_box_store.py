@@ -35,6 +35,13 @@ def box_number_source(port):
     return f"{source}（已核对）" if port["verified"] else source
 
 
+def box_connection_label(connection):
+    label = f"{connection['board']}{connection['number']}"
+    if connection["branch"] is not None:
+        label += f" / {connection['branch']}"
+    return label
+
+
 class SampleBoxStore:
     def sample_box_ports(self):
         return sample_box_ports(self.db)

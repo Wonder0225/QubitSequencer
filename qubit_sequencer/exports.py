@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import csv
+import math
+from itertools import groupby
 from pathlib import Path
 
 from openpyxl import Workbook
@@ -13,7 +15,7 @@ from .device_types import DEVICE_NAMES
 from .storage import ChipStore, SCHEMA_VERSION, display_timestamp
 from .wiring_store import WIRING_EXPORT_HEADERS, wiring_export_values
 from .readout_store import readout_endpoints
-from .sample_box_store import BOX_ROLES, box_number_source
+from .sample_box_store import BOX_ROLES, box_connection_label, box_number_source
 from .parameter_rules import (BIAS_Z_HEADERS, PI_AMPLITUDE, PI_LENGTH, PI_PRODUCT,
                               format_bias_z, pi_product, record_value, uses_bias_z)
 
@@ -134,7 +136,10 @@ def build_tables(store: ChipStore, point: str = "default",
 
 def export_xlsx(store: ChipStore, path: str | Path, point: str = "default",
                 include_history: bool = False) -> None:
-    tables = build_tables(store, point, include_history)
+    _write_xlsx(path, build_tables(store, point, include_history))
+
+
+def _write_xlsx(path, tables):
     workbook = Workbook()
     workbook.remove(workbook.active)
     for title, (headers, rows) in tables.items():
@@ -156,6 +161,48 @@ def export_xlsx(store: ChipStore, path: str | Path, point: str = "default",
     workbook.save(path)
 
 
+def _write_csv(path, headers, rows):
+    with Path(path).open("w", encoding="utf-8-sig", newline="") as stream:
+        writer = csv.writer(stream)
+        writer.writerow(headers)
+        writer.writerows(rows)
+
+
+def export_sample_box_wiring(store: ChipStore, path: str | Path, connections) -> None:
+    path = Path(path)
+    headers = ["圈序", "样品盒接口", "制冷机端口", "信号名称", "元件"]
+    drawing = store.sample_box_appearance()["drawing"]
+    if drawing["cover"]:
+        x, y, width, height = drawing["cover"]
+        center_x, center_y = x + width / 2, y + height / 2
+    else:
+        xs, ys = zip(*drawing["outline"])
+        center_x, center_y = (min(xs) + max(xs)) / 2, (min(ys) + max(ys)) / 2
+    origin_x, origin_y = drawing["origin"]
+    pitch = drawing["pitch"]
+    center_x, center_y = (center_x - origin_x) / pitch, (center_y - origin_y) / pitch
+
+    def position(port):
+        dx, dy = port["x"] - center_x, port["y"] - center_y
+        return max(abs(dx), abs(dy)), math.atan2(dx, -dy) % math.tau
+
+    rows = []
+    ports = sorted(store.sample_box_ports(), key=position)
+    for ring, (_, members) in enumerate(groupby(ports, key=lambda port: position(port)[0]), 1):
+        for port in members:
+            connection = connections.get(port["id"])
+            if connection is None:
+                continue
+            rows.append([ring, port["number"], box_connection_label(connection),
+                         port["signal_name"], port["device_label"] or ""])
+    if path.suffix.lower() == ".xlsx":
+        _write_xlsx(path, {"样品盒接线": (headers, rows)})
+    elif path.suffix.lower() == ".csv":
+        _write_csv(path, headers, rows)
+    else:
+        raise ValueError("请选择 XLSX 或 CSV 格式")
+
+
 def export_csv(store: ChipStore, directory: str | Path, point: str = "default",
                include_history: bool = False) -> list[Path]:
     directory = Path(directory)
@@ -170,9 +217,6 @@ def export_csv(store: ChipStore, directory: str | Path, point: str = "default",
         if title == DEVICE_NAMES["custom"] and not rows:
             continue
         path = directory / f"{names[title]}.csv"
-        with path.open("w", encoding="utf-8-sig", newline="") as stream:
-            writer = csv.writer(stream)
-            writer.writerow(headers)
-            writer.writerows(rows)
+        _write_csv(path, headers, rows)
         written.append(path)
     return written

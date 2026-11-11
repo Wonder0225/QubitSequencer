@@ -3,11 +3,10 @@
 from __future__ import annotations
 
 import hashlib
-from html import escape
 import math
 from pathlib import Path
 
-from PySide6.QtCore import QPoint, QPointF, QRectF, QSize, Qt, Signal, QVariantAnimation
+from PySide6.QtCore import QPoint, QPointF, QRectF, QSize, QSignalBlocker, Qt, Signal, QVariantAnimation
 from PySide6.QtGui import (QBrush, QColor, QFont, QFontDatabase, QImage, QPainter,
                            QPen, QPolygonF, QPainterPath, QPainterPathStroker, QTextOption, QTransform)
 from PySide6.QtSvg import QSvgGenerator
@@ -140,9 +139,10 @@ class ChipScene(QGraphicsScene):
     clicked = Signal(str, str)
     blank_clicked = Signal(float, float)
     device_context_requested = Signal(str, QPoint)
+    devices_moved = Signal(tuple, float, float)
 
     def __init__(self, store: ChipStore, field: str = "", point: str = "default",
-                 theme: str = "light", *, readout_visible=True):
+                 theme: str = "light", *, readout_visible=True, fridge_values=None, fridge_status=""):
         super().__init__()
         self.store = store
         self.field = field
@@ -151,11 +151,15 @@ class ChipScene(QGraphicsScene):
         self.colors = DIAGRAM_COLORS[self.theme]
         self.content_rect = QRectF()
         self.readout_visible = readout_visible
+        self.fridge_values = fridge_values or {}
+        self.fridge_status = fridge_status
         self.deemphasize_couplers = readout_visible and bool(store.devices("readout"))
         self._coupler_ids = {row["id"] for row in store.devices("coupler")}
         self.last_click_scene_pos = None
         self.last_click_screen_pos = None
         self._device_items = {}
+        self._selection_order = []
+        self._drag_annotations = {}
         self._animations = {}
         self.readout_start = None
         self.readout_end = None
@@ -163,6 +167,28 @@ class ChipScene(QGraphicsScene):
 
     def logical_at(self, pos) -> tuple[float, float]:
         return ((pos.x() - PAD) / CELL, (pos.y() - PAD) / CELL)
+
+    def selected_devices(self):
+        selected = {ident for ident, item in self._device_items.items() if item.isSelected()}
+        self._selection_order = [ident for ident in self._selection_order if ident in selected]
+        added = selected - set(self._selection_order)
+        self._selection_order.extend(sorted(added, key=lambda ident: (self._device_items[ident].sceneBoundingRect().center().y(),
+                                                                      self._device_items[ident].sceneBoundingRect().center().x(), ident)))
+        return tuple(self._selection_order)
+
+    def select_devices(self, ids):
+        ids = tuple(dict.fromkeys(ident for ident in ids if ident in self._device_items))
+        if set(ids) == set(self.selected_devices()):
+            return
+        with QSignalBlocker(self):
+            for ident, item in self._device_items.items():
+                item.setSelected(ident in ids)
+        self._selection_order = list(ids)
+        self.selectionChanged.emit()
+
+    def set_device_movement(self, enabled):
+        for item in self._device_items.values():
+            item.setFlag(QGraphicsItem.GraphicsItemFlag.ItemIsMovable, enabled)
 
     def grow_to_include(self, rect: QRectF) -> None:
         current = self.sceneRect()
@@ -210,6 +236,15 @@ class ChipScene(QGraphicsScene):
             self.readout_end = (round(x*2)/2, round(y*2)/2)
             self.update()
         super().mouseMoveEvent(event)
+        if event.buttons() & Qt.MouseButton.LeftButton:
+            moved = {ident: item for ident, item in self._device_items.items() if not item.pos().isNull()}
+            if moved and not self._drag_annotations:
+                for item in self.items():
+                    target = item.data(0)
+                    if target and target[0] == "device" and target[1] in moved and item is not moved[target[1]]:
+                        self._drag_annotations[item] = (moved[target[1]], item.pos())
+            for item, (device, origin) in self._drag_annotations.items():
+                item.setPos(origin + device.pos())
 
     def drawForeground(self, painter, rect):
         super().drawForeground(painter, rect)
@@ -245,6 +280,19 @@ class ChipScene(QGraphicsScene):
         super().contextMenuEvent(event)
 
     def mouseReleaseEvent(self, event):
+        if event.button() == Qt.MouseButton.LeftButton:
+            moved = tuple(ident for ident, item in self._device_items.items() if not item.pos().isNull())
+            if moved:
+                delta = self._device_items[moved[0]].pos()
+                super().mouseReleaseEvent(event)
+                for ident in moved:
+                    self._device_items[ident].setPos(QPointF())
+                for item, (_, origin) in self._drag_annotations.items():
+                    item.setPos(origin)
+                self._drag_annotations.clear()
+                self.devices_moved.emit(moved, delta.x() / CELL, delta.y() / CELL)
+                return
+            self._drag_annotations.clear()
         if (event.button() != Qt.MouseButton.LeftButton or not hasattr(self, "_press_pos")
                 or (event.screenPos() - self._press_pos).manhattanLength() > 4):
             super().mouseReleaseEvent(event)
@@ -255,7 +303,7 @@ class ChipScene(QGraphicsScene):
             return
         if item is not None:
             kind, ident = item.data(0)
-            self.last_click_screen_pos = event.screenPos()
+            self.last_click_screen_pos = None if event.modifiers() & Qt.KeyboardModifier.ControlModifier else event.screenPos()
             self.last_click_scene_pos = event.scenePos()
             if kind == "device" and self.store.device(ident)["kind"] != "readout":
                 self.animate_device(ident)
@@ -342,9 +390,9 @@ class ChipScene(QGraphicsScene):
         label.document().setDefaultTextOption(option)
         return label
 
-    def _callout(self, label, rect, anchor, radius=0):
+    def _callout(self, label, rect, anchor, radius=0, *, color=None):
         """Readable full text with a paper backing and a discreet leader."""
-        label.setDefaultTextColor(QColor(self.colors["ink"]))
+        label.setDefaultTextColor(QColor(color or self.colors["ink"]))
         label.setPos(rect.topLeft())
         background = QGraphicsRectItem(rect.adjusted(-3, -2, 3, 2))
         background.setBrush(QBrush(QColor(self.colors["paper"])))
@@ -364,6 +412,7 @@ class ChipScene(QGraphicsScene):
             leader.setPen(QPen(QColor(self.colors["muted"]), 0.7))
             leader.setOpacity(label.opacity())
             leader.setZValue(0)
+            leader.setData(0, label.data(0))
             leader.setAcceptedMouseButtons(Qt.MouseButton.NoButton)
             self.addItem(leader)
 
@@ -441,11 +490,7 @@ class ChipScene(QGraphicsScene):
         PALETTE = self.colors["categories"]
         devices = [device for device in self.store.devices()
                    if self.readout_visible or device["kind"] not in ("readout", "filter")]
-        custom_names = {}
-        for device in devices:
-            if device["kind"] == "custom":
-                custom_names.setdefault(device["subtype"], []).append(device["label"])
-        custom_colors = custom_device_colors(custom_names)
+        custom_colors = custom_device_colors(device["subtype"] for device in devices if device["kind"] == "custom")
         couplings = self.store.couplings()
         links = self.store.links()
         meta = self.store.meta()
@@ -472,7 +517,7 @@ class ChipScene(QGraphicsScene):
                     PAD + (device["y"] + device["dy"]) * CELL)
 
         definition = None
-        if self.field and self.field not in ("device.subtype", "device.role", "coupling.mode") and not self.field.startswith("wiring."):
+        if self.field and self.field not in ("device.subtype", "device.role", "coupling.mode") and not self.field.startswith(("wiring.", "sample_box.")):
             try:
                 definition = self.store.definition(self.field)
             except KeyError:
@@ -493,12 +538,22 @@ class ChipScene(QGraphicsScene):
             raw = {d["id"]: d["role"] for d in devices}
         elif self.field == "coupling.mode":
             raw = {c["id"]: c["mode"] for c in couplings}
+        elif self.field.startswith("sample_box."):
+            for p in self.store.sample_box_ports():
+                if not p["device_id"]: continue
+                role = {"read_in": "读入", "read_out": "读出"}.get(p["role"], "")
+                value = (p["number"] if self.field == "sample_box.number" else p["signal_name"]) or ""
+                if value and role: value += f"（{role}）"
+                if value: raw[p["device_id"]] = "、".join(filter(None, (raw.get(p["device_id"]), value)))
         elif self.field.startswith("wiring."):
             attr = self.field.split(".", 1)[1]
             for line in self.store.lines():
                 for dev_id in self.store.line_devices(line["id"]):
                     old, val = raw.get(dev_id), line[attr]
+                    val = f"旧接线: {val}" if val and self.fridge_status else val
                     raw[dev_id] = f"{old}, {val}" if old and val and val not in str(old).split(", ") else (old or val)
+            for dev_id, val in self.fridge_values.get(attr, {}).items():
+                raw[dev_id] = ", ".join(filter(None, (raw.get(dev_id), val)))
 
         numeric = [float(v) for v in raw.values() if isinstance(v, (int, float)) and math.isfinite(float(v))]
         lo, hi = (min(numeric), max(numeric)) if numeric else (0.0, 1.0)
@@ -591,7 +646,7 @@ class ChipScene(QGraphicsScene):
             ident = device["id"]
             is_qubit = device["kind"] == "qubit"
             relevant = (definition is not None and definition["scope"] == device["kind"] or
-                        self.field in ("device.subtype", "device.role") or self.field.startswith("wiring."))
+                        self.field in ("device.subtype", "device.role") or self.field.startswith(("wiring.", "sample_box.")))
             radius = 20 if is_qubit else 12
             if self.field and relevant:
                 value = raw.get(ident)
@@ -629,7 +684,7 @@ class ChipScene(QGraphicsScene):
                     COUPLER if device["kind"] == "coupler" else
                     custom_colors[device["subtype"]] if is_custom else DEVICE_COLORS[device["kind"]])
             relevant = (definition is not None and definition["scope"] == device["kind"] or
-                        self.field in ("device.subtype", "device.role") or self.field.startswith("wiring."))
+                        self.field in ("device.subtype", "device.role") or self.field.startswith(("wiring.", "sample_box.")))
             fill = (color(raw.get(device["id"]), base)
                     if relevant and not (is_custom and self.field == "device.subtype") else QColor(base))
             radius = radii[device["id"]]
@@ -705,14 +760,14 @@ class ChipScene(QGraphicsScene):
                 label.setScale(factor)
                 label.setPos(x - label.boundingRect().width()*factor/2,
                              y - label.boundingRect().height()*factor/2)
-            elif not self.field and device["kind"] == "filter":
+            elif not self.field and device["kind"] in ("filter", "custom"):
                 anchor = QPointF(x, y)
                 label = self._parameter_text(device["label"], ("device", device["id"]), tex=True)
                 bounds = label.boundingRect()
                 candidates = ((anchor + QPointF(dx*(radius+bounds.width()/2+8), dy*(radius+bounds.height()/2+8)), anchor)
                               for dx, dy in ((0,1),(0,-1),(1,0),(-1,0),(1,1),(-1,1),(1,-1),(-1,-1)))
                 rect, _ = obstacles.place(bounds.width(), bounds.height(), candidates)
-                self._callout(label, rect, anchor, radius)
+                self._callout(label, rect, anchor, radius, color=base if is_custom else None)
             elif not self.field and device["kind"] == "readout":
                 end_x, end_y = readout_routes[device["id"]](1)
                 anchor = QPointF(PAD+end_x*CELL, PAD+end_y*CELL)
@@ -722,7 +777,7 @@ class ChipScene(QGraphicsScene):
                               for dx, dy in ((1,-1),(-1,-1),(1,1),(-1,1))]
                 rect, _ = obstacles.place(bounds.width(), bounds.height(), candidates)
                 self._callout(label, rect, anchor, 3)
-            elif not self.field and not is_custom:
+            elif not self.field:
                 neighbors = linked_qubits.get(device["id"], [])
                 horizontal = len(neighbors) == 2 and abs(neighbors[0]["y"] - neighbors[1]["y"]) < 0.01
                 if horizontal:
@@ -776,13 +831,7 @@ class ChipScene(QGraphicsScene):
         for kind, symbol in (("readout", "━"), ("filter", "■")):
             if any(d["kind"] == kind for d in devices):
                 legend.append((f"{symbol} {DEVICE_NAMES[kind]}", DEVICE_COLORS[kind]))
-        custom_legend = {}
-        for subtype, swatch in custom_colors.items():
-            names = custom_names[subtype]
-            caption = f"⬢ {subtype} · {'、'.join(names)}"
-            names_html = "、".join(map(tex_to_html, names))
-            custom_legend[caption] = f'<span style="color:{swatch}">⬢</span> {escape(subtype)} · {names_html}'
-            legend.append((caption, swatch))
+        legend.extend((f"⬢ {subtype}", swatch) for subtype, swatch in custom_colors.items())
         if any(c["mode"] == "direct" for c in couplings):
             legend.append(("━━ 直接电容", DIRECT))
         if links:
@@ -790,30 +839,29 @@ class ChipScene(QGraphicsScene):
         self.legend_entries = legend
         self._legend_items = []
         for caption, swatch in legend:
-            if caption in custom_legend:
-                item = self._text(caption, 0, 0, 9, INK, True)
-                item.setHtml(custom_legend[caption])
+            custom_entry = caption.startswith("⬢ ")
+            item = self._text(caption, 0, 0, 9, swatch, True, tex=not custom_entry)
+            if custom_entry:
                 max_width = max(410, self.body_rect.width())
                 if item.boundingRect().width() > max_width:
                     item.setTextWidth(max_width)
-            else:
-                item = self._text(caption, 0, 0, 9, swatch, True, tex=True)
-                if self.deemphasize_couplers and swatch == COUPLER:
-                    item.setOpacity(.4)
+            elif self.deemphasize_couplers and swatch == COUPLER:
+                item.setOpacity(.4)
             item.setParentItem(self.footer_item)
             self._legend_items.append(item)
         self._parameter_items = []
         if self.field:
             field_label = definition["label"] if definition else {
                 "device.subtype": "器件类型", "device.role": "表面码角色",
-                "coupling.mode": "耦合方式", "wiring.line_type": "接线类型",
+                "coupling.mode": "耦合方式", "sample_box.number": "样品盒接口", "sample_box.signal": "样品盒信号", "wiring.line_type": "接线类型",
                 "wiring.cryostat": "制冷机", "wiring.port": "制冷机端口",
                 "wiring.channel": "线路通道",
             }.get(self.field, self.field)
             self._parameter_items.append(self._text(f"{field_label}  ·  {self.point}",
                                                     0, 0, 11, INK, True, tex=True))
             scale_y = 30
-            self._parameter_items.append(self._text("灰色 = 未填写", 0, scale_y, 9, MUTED))
+            note = self.fridge_status if self.field.startswith("wiring.") and self.fridge_status else "灰色 = 未填写"
+            self._parameter_items.append(self._text(note, 0, scale_y, 9, MUTED))
             if numeric:
                 for i in range(30):
                     t = i / 29
@@ -868,12 +916,12 @@ class ChipScene(QGraphicsScene):
 
 def export_diagram(store: ChipStore, path: str | Path, field: str = "",
                    point: str = "default", width: int = 1800,
-                   theme: str = "light", *, readout_visible=True) -> None:
+                   theme: str = "light", *, readout_visible=True, fridge_values=None, fridge_status="") -> None:
     """Export a tight crop of the vector scene; the editor canvas remains unbounded."""
     path = Path(path)
     if width < 400 or width > 10000:
         raise ValueError("image width must be 400..10000")
-    scene = ChipScene(store, field, point, theme, readout_visible=readout_visible)
+    scene = ChipScene(store, field, point, theme, readout_visible=readout_visible, fridge_values=fridge_values, fridge_status=fridge_status)
     source = scene.content_rect
     height = max(400, round(width * source.height() / source.width()))
     if path.suffix.lower() == ".png":

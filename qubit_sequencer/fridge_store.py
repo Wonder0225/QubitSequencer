@@ -559,6 +559,35 @@ class FridgeStore:
                 drawing=excluded.drawing,devices_json=excluded.devices_json,notes=excluded.notes,
                 box_port_id=excluded.box_port_id""", (port_id, *values))
 
+    @undoable("快捷接线")
+    def quick_assign(self, sample_id, chip_path, selected):
+        from .quick_wiring import compatible
+        if self.sample_path(sample_id) != Path(chip_path).resolve():
+            raise ValueError("关联样品已变化")
+        boxes = [row[0]['id'] for row in selected]; ports = [row[1] for row in selected]
+        if len(set(boxes)) != len(boxes) or len(set(ports)) != len(ports):
+            raise ValueError("样品盒接口或端口重复")
+        self.db.execute("ATTACH DATABASE ? AS quick_sample", (str(self.sample_path(sample_id)),))
+        try:
+            with self.db:
+                self.db.execute("BEGIN IMMEDIATE")
+                if self.sample_path(sample_id) != Path(chip_path).resolve(): raise ValueError("关联样品已变化")
+                current = {p['id']: p for p in self.sample_box_ports(sample_id)}
+                used = {p['box_port_id'] for p in self.box_connections(sample_id)}
+                for box, ident, expected_port in selected:
+                    existing = current.get(box['id']); port = self.port(ident)
+                    if not existing or any(existing[k] != box[k] for k in ('number', 'device_id', 'role', 'signal_name')):
+                        raise ValueError("样品盒接口已变化")
+                    if box['id'] in used or port['sample_id'] or port['manually_occupied'] or self.circuit(ident).get('switch'):
+                        raise ValueError("接口或目标端口已占用或不可用于快捷接线")
+                    if (port['board'], port['number'], port['kind']) != expected_port or not compatible(existing, port):
+                        raise ValueError("目标端口类型已变化或不匹配")
+                    self.db.execute("""INSERT INTO assignments
+                        (port_id,sample_id,usage,pin,drawing,devices_json,notes,legacy_json,box_port_id)
+                        VALUES (?,?,?,?,?,?,?,?,?)""", (ident, sample_id, port['kind'], '', '', '[]', '', '{}', box['id']))
+        finally:
+            self.db.execute("DETACH DATABASE quick_sample")
+
     @undoable("解除分配")
     def unassign(self, port_id, branch=None):
         self._check_available(port_id, branch)
@@ -567,6 +596,29 @@ class FridgeStore:
                 self.db.execute("DELETE FROM assignments WHERE port_id=?", (port_id,))
             else:
                 self.db.execute("DELETE FROM branch_assignments WHERE port_id=? AND branch=?", (port_id, branch))
+
+    def unassign_preview(self, port_ids):
+        removable, protected = [], []
+        for port_id in dict.fromkeys(port_ids):
+            port = self.port(port_id)
+            marks = self.branch_marks(port_id)
+            rows = self.branch_assignments(port_id) if self.circuit(port_id).get("switch") else ([port] if port["direct_sample_id"] else [])
+            for row in rows:
+                branch = row["branch"] if "branch" in row.keys() else None
+                entry = {"port_id": port_id, "board": port["board"], "number": port["number"],
+                         "branch": branch, "sample": row["sample_name"], "legacy": bool(row["legacy_json"] and row["legacy_json"] != "{}")}
+                (protected if port["manually_occupied"] or branch in marks else removable).append(entry)
+        return removable, protected
+
+    @undoable("批量解除分配")
+    def unassign_many(self, targets):
+        for port_id, branch in targets: self._check_available(port_id, branch)
+        with self.db:
+            for port_id, branch in targets:
+                if branch is None:
+                    self.db.execute("DELETE FROM assignments WHERE port_id=?", (port_id,))
+                else:
+                    self.db.execute("DELETE FROM branch_assignments WHERE port_id=? AND branch=?", (port_id, branch))
 
     def migration_preview(self, sample_id):
         ports = {(p["board"].upper(), p["number"].upper()): p for p in self.ports()}

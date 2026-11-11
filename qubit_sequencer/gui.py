@@ -810,7 +810,7 @@ class MainWindow(QMainWindow, WorkbenchLayout):
             self.readout_visible_action.setChecked(True)
         if hasattr(self, "device_popup"):
             self.device_popup.close()
-        hints = {self.view_action: "查看模式 · 左键点选或框选，右键拖动平移，滚轮缩放",
+        hints = {self.view_action: "左键框选或 Ctrl 点选 · 拖动元件移动 · Delete 删除 · 右键拖动平移",
                  self.place_action: "放置比特 · 点击空格点",
                  self.place_coupler_action: "放置耦合器 · 点击空格点或半格",
                  self.place_readout_action: "放置读取线 · 依次点击起点和终点，吸附格点／半格 · Esc 取消",
@@ -819,6 +819,8 @@ class MainWindow(QMainWindow, WorkbenchLayout):
                  self.connect_action: "连接模式 · 依次点击两个器件"}
         active = next(action for action in actions if action.isChecked())
         self.view.setDragMode(QGraphicsView.DragMode.RubberBandDrag if active is self.view_action else QGraphicsView.DragMode.NoDrag)
+        if self.scene:
+            self.scene.set_device_movement(active is self.view_action)
         if hasattr(self, "mode_hint"):
             self.mode_hint.setText(hints[active])
         self._update_ui_state()
@@ -1067,6 +1069,8 @@ class MainWindow(QMainWindow, WorkbenchLayout):
             self.tabs.setCurrentWidget(self.fridge_page)
         if self.tabs.is_page_visible(self.sample_box_panel):
             self.sample_box_panel.refresh_connections()
+        if self.store and self.scene and (self.field_combo.currentData() or '').startswith('wiring.'):
+            self.refresh_scene()
         self._update_undo_action()
 
     def _active_fridge_panel(self):
@@ -1126,7 +1130,7 @@ class MainWindow(QMainWindow, WorkbenchLayout):
             suffix = f" [{definition['unit']}]" if definition["unit"] else ""
             self.field_combo.addItem(f"{scope} · {definition['label']}{suffix}", definition["key"])
             self.field_combo.setItemData(self.field_combo.count()-1, definition["key"], Qt.ItemDataRole.ToolTipRole)
-        for label, key in (("器件类型", "device.subtype"), ("表面码角色", "device.role"),
+        for label, key in (("样品盒接口", "sample_box.number"), ("样品盒信号", "sample_box.signal"), ("器件类型", "device.subtype"), ("表面码角色", "device.role"),
                            ("耦合方式", "coupling.mode"), ("接线类型", "wiring.line_type"),
                            ("制冷机", "wiring.cryostat"), ("制冷机端口", "wiring.port"),
                            ("线路通道", "wiring.channel")):
@@ -1187,15 +1191,24 @@ class MainWindow(QMainWindow, WorkbenchLayout):
         field = self.field_combo.currentData() or ""
         old_center = None
         old_transform = None
+        selected_devices = ()
+        if self.scene is not None and self.scene.store is self.store:
+            selected_devices = self.scene.selected_devices()
         if self.scene is not None and self.scene.store is self.store and self.scene.field == field:
             old_center = self.view.mapToScene(self.view.viewport().rect().center())
             old_transform = self.view.transform()
+        from .quick_wiring import diagram_values
+        fridge_values, fridge_status = diagram_values(self.store, self.fridge_panel)
         self.scene = ChipScene(self.store, field,
                                self.point_combo.currentText() or "default", self.theme,
-                               readout_visible=self.readout_visible_action.isChecked())
+                               readout_visible=self.readout_visible_action.isChecked(), fridge_values=fridge_values, fridge_status=fridge_status)
         self.scene.clicked.connect(self.on_scene_clicked)
         self.scene.blank_clicked.connect(self.on_blank_clicked)
         self.scene.device_context_requested.connect(self.show_device_context_menu)
+        self.scene.devices_moved.connect(self.move_canvas_devices)
+        self.scene.set_device_movement(self.view_action.isChecked())
+        self.scene.select_devices(selected_devices)
+        self.scene.selectionChanged.connect(self.canvas_selection_changed)
         self.scene.set_readout_start(self.readout_start)
         self.view.setScene(self.scene)
         if old_center is None:
@@ -1230,10 +1243,61 @@ class MainWindow(QMainWindow, WorkbenchLayout):
         if kind and ident:
             self.selected = (kind, ident)
             self.tabs.setCurrentWidget(self.topology_page)
+            self.scene.select_devices((ident,) if kind == "device" else ())
             self.refresh_detail()
+
+    def topology_device_selection(self):
+        return self.scene.selected_devices() if self.scene and self.view_action.isChecked() else ()
+
+    def quick_wiring(self):
+        from .quick_wiring import QuickWiringDialog, linked_sample
+        panel = self.fridge_panel
+        if not self.store or not panel or panel.preview:
+            QMessageBox.information(self, '快捷接线', '请先打开芯片和制冷机项目。'); return
+        if not self.tabs.multicolumn or not self.tabs.is_page_visible(self.fridge_page):
+            QMessageBox.information(self, '快捷接线', '请启用多栏模式并同时显示芯片构型和制冷机布线。'); return
+        if panel.is_overview():
+            QMessageBox.information(self, '快捷接线', '请在制冷机布线中选择单盘。'); return
+        sample = linked_sample(self.store, panel.store)
+        if not sample:
+            QMessageBox.information(self, '快捷接线', '请先在制冷机项目中关联当前芯片。'); return
+        devices = self.topology_device_selection(); ports = panel.selected_port_ids()
+        if not devices or not ports:
+            QMessageBox.information(self, '快捷接线', '请在芯片图和制冷机盘面分别选中元件与目标端口。'); return
+        if QuickWiringDialog(self, self.store, panel.store, sample, devices, ports).exec() == QDialog.DialogCode.Accepted:
+            panel.refresh_filters(); panel.refresh(); self.refresh_scene()
+            self.sample_box_panel.refresh()
+            self.statusBar().showMessage('快捷接线已保存，可在制冷机页面撤回。', 5000)
+
+    def canvas_selection_changed(self):
+        if self.sender() is not self.scene or not self.view_action.isChecked() or not self.store:
+            return
+        ids = self.topology_device_selection()
+        if len(ids) > 1 or not ids:
+            self.device_popup.close()
+        if ids and (not self.selected or self.selected[0] != "device" or self.selected[1] not in ids):
+            self.selected = ("device", ids[0])
+        elif not ids and self.selected and self.selected[0] == "device":
+            self.selected = None
+        self.refresh_detail()
+
+    def move_canvas_devices(self, ids, dx, dy):
+        step = 1 if any(self.store.device(ident)["kind"] == "qubit" for ident in ids) else .5
+        dx, dy = round(dx / step) * step, round(dy / step) * step
+        if not (dx or dy):
+            return
+        try:
+            self.store.move_devices(ids, dx, dy)
+            self.device_popup.close()
+            self.refresh_content()
+            self._written("移动元件")
+        except Exception as exc:
+            self._error("移动失败", exc)
 
     def show_device_context_menu(self, ident: str, anchor: QPoint):
         self.device_popup.close()
+        if ident not in self.topology_device_selection():
+            self.scene.select_devices((ident,))
         self.selected = ("device", ident)
         self.refresh_detail()
         self.detail_menu.popup(anchor)
@@ -1265,6 +1329,10 @@ class MainWindow(QMainWindow, WorkbenchLayout):
                 return
             self._connect(first, ident)
             return
+        if self.scene and self.view_action.isChecked() and kind == "device":
+            if scene_pos is not None and anchor is None:
+                return  # Qt handles Ctrl-click selection.
+            self.scene.select_devices((ident,))
         self.selected = (kind, ident)
         self.refresh_detail()
         if kind == "device" and anchor is not None:
@@ -1527,20 +1595,28 @@ class MainWindow(QMainWindow, WorkbenchLayout):
 
     @undoable("删除所选对象")
     def delete_selected(self):
-        if (not self.store or not self.selected or self.tabs.currentWidget() is not self.topology_page
+        if (not self.store or self.tabs.currentWidget() is not self.topology_page
                 or self.chip_views.currentIndex() != 0):
             return
-        name = self.delete_action.text().removeprefix("删除 ")
+        devices = self.topology_device_selection()
+        if not devices and not self.selected:
+            return
+        kind, ident = ("device", devices[0]) if devices else self.selected
+        if len(devices) > 1:
+            name = f"所选 {len(devices)} 个元件"
+        elif kind == "device":
+            name = self.store.device(ident)["label"]
+        else:
+            name = self.delete_action.text().removeprefix("删除 ")
         if QMessageBox.question(self, "确认删除", f"删除 {name} 及其关联记录？") != QMessageBox.StandardButton.Yes:
             return
-        kind, ident = self.selected
         try:
             if kind == "device":
-                self.store.delete_device(ident)
-                if self.first_endpoint == ident:
+                ids = devices or (ident,)
+                self.store.delete_devices(ids)
+                if self.first_endpoint in ids:
                     self.first_endpoint = None
             elif kind == "coupling":
-                coupling = self.store.coupling(ident)
                 self.store.delete_coupling(ident)
             elif kind == "readout_link":
                 self.store.delete_readout_link(ident)
@@ -1917,9 +1993,11 @@ class MainWindow(QMainWindow, WorkbenchLayout):
         if not ok:
             return
         try:
+            from .quick_wiring import diagram_values
+            fridge_values, fridge_status = diagram_values(self.store, self.fridge_panel)
             export_diagram(self.store, path, self.field_combo.currentData() or "",
                            self.point_combo.currentText() or "default", width,
-                           theme=self.theme, readout_visible=self.readout_visible_action.isChecked())
+                           theme=self.theme, readout_visible=self.readout_visible_action.isChecked(), fridge_values=fridge_values, fridge_status=fridge_status)
             self.statusBar().showMessage(f"图片已导出：{path}")
         except Exception as exc:
             self._error("图片导出失败", exc)
@@ -1934,7 +2012,9 @@ class MainWindow(QMainWindow, WorkbenchLayout):
         if not ok:
             return
         try:
-            fields = ["", "device.subtype", "device.role", "coupling.mode", "wiring.line_type",
+            from .quick_wiring import diagram_values
+            fridge_values, fridge_status = diagram_values(self.store, self.fridge_panel)
+            fields = ["", "device.subtype", "device.role", "coupling.mode", "sample_box.number", "sample_box.signal", "wiring.line_type",
                       "wiring.cryostat", "wiring.port", "wiring.channel"]
             fields += [d["key"] for d in self.store.definitions()]
             if any((Path(directory) / f"{field or 'topology'}.{fmt.lower()}").exists() for field in fields):
@@ -1946,7 +2026,7 @@ class MainWindow(QMainWindow, WorkbenchLayout):
                 name = field or "topology"
                 export_diagram(self.store, Path(directory) / f"{name}.{fmt.lower()}",
                                field, self.point_combo.currentText() or "default",
-                               theme=self.theme, readout_visible=self.readout_visible_action.isChecked())
+                               theme=self.theme, readout_visible=self.readout_visible_action.isChecked(), fridge_values=fridge_values, fridge_status=fridge_status)
             self.statusBar().showMessage(f"已导出 {len(fields)} 张图片到 {directory}")
         except Exception as exc:
             self._error("批量导出失败", exc)

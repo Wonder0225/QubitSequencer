@@ -6,7 +6,7 @@ from contextlib import closing
 
 import pytest
 from PySide6.QtCore import Qt
-from PySide6.QtGui import QColor, QImage
+from PySide6.QtGui import QImage
 from PySide6.QtWidgets import QApplication, QDialog, QGraphicsTextItem
 
 from qubit_sequencer import gui, sample_box_ui
@@ -255,13 +255,16 @@ def test_custom_device_can_be_placed_edited_and_wired(tmp_path, monkeypatch):
         load = window.store.add_device('custom', 'R_in < 50', None, 2.5, 2)
         same = window.store.add_device('custom', '直通线', None, 3.5, 2)
         window.refresh_content()
-        assert not any(item.data(0) in [('device', key) for key in (ident, load, same)]
-                       for item in window.scene.items() if isinstance(item, QGraphicsTextItem))
-        legend = [item.toPlainText() for item in window.scene._legend_items]
-        assert '⬢ 直通线 · u1、u3' in legend and '⬢ R_in < 50 · u2' in legend
+        labels = {item.data(0)[1]: item for item in window.scene.items()
+                  if isinstance(item, QGraphicsTextItem) and item.data(0)}
+        legend = {item.toPlainText(): item for item in window.scene._legend_items}
         colors = {key: window.scene._device_items[key].brush().color() for key in (ident, load, same)}
         assert colors[ident] == colors[same] != colors[load]
-        assert QColor(dict(window.scene.legend_entries)['⬢ 直通线 · u_{1}、u_{3}']) == colors[ident]
+        for key, text in ((ident, 'u1'), (load, 'u2'), (same, 'u3')):
+            assert labels[key].toPlainText() == text
+            assert labels[key].defaultTextColor() == colors[key]
+        assert legend['⬢ 直通线'].defaultTextColor() == colors[ident]
+        assert legend['⬢ R_in < 50'].defaultTextColor() == colors[load]
 
         image_path = tmp_path / 'layout.png'
         image = QImage(120, 120, QImage.Format.Format_RGB32)
@@ -369,11 +372,32 @@ def test_smart_wiring_live_mapping_and_exports(tmp_path):
         fridge.assign(a10, sid, box_port_id=a); fridge.assign(f4, sid, box_port_id=b, branch='3')
     window = gui.MainWindow(str(sample)); window.show(); app.processEvents()
     panel = window.sample_box_panel; window.tabs.setCurrentWidget(panel); panel.refresh(); panel.smart_wiring.setChecked(True)
+    def captions(port_id):
+        return {child.text(): child for child in panel.items[port_id].childItems() if isinstance(child, QGraphicsSimpleTextItem)}
+
     def labels(port_id):
-        return [child.text() for child in panel.items[port_id].childItems() if isinstance(child, QGraphicsSimpleTextItem)]
+        return captions(port_id).keys()
+
+    menu_actions = panel.display_button.menu().actions()
+    assert [action.text() for action in menu_actions] == ['显示元件名称', '智能接线', '隐去未分配']
+    assert all(action.isCheckable() for action in menu_actions)
+    assert not panel.hide_unassigned.isEnabled()
     assert '未知' in labels(a)
     window._open_fridge_path(str(project)); panel.refresh_connections(); app.processEvents()
     assert 'A10' in labels(a) and 'FO4 / 3' in labels(b)
+    name_rect = captions(a)['Q1'].sceneBoundingRect()
+    target_rect = captions(a)['A10'].sceneBoundingRect()
+    assert name_rect.bottom() < target_rect.top()
+    assert target_rect.height() > 15
+    below = next(port['id'] for port in ports if (port['x'], port['y']) == (ports[0]['x'], ports[0]['y'] + 1))
+    assert target_rect.bottom() < panel.items[below].sceneBoundingRect().top()
+    assert target_rect.right() < captions(b)['FO4 / 3'].sceneBoundingRect().left()
+    panel.show_names.setChecked(False)
+    assert captions(a)['A10'].sceneBoundingRect().height() > target_rect.height()
+    panel.show_names.setChecked(True)
+    panel.rotate_right.click()
+    assert captions(a)['A10'].sceneBoundingRect().bottom() < panel.items[b].sceneBoundingRect().top()
+    panel.rotate_left.click()
     panel.items[a].setSelected(True)
     for ext in ('png', 'svg', 'pdf'):
         path = tmp_path / f'wiring.{ext}'; panel.export_scene(path)
@@ -382,5 +406,73 @@ def test_smart_wiring_live_mapping_and_exports(tmp_path):
     assert b'<svg' in (tmp_path / 'wiring.svg').read_bytes()[:500]
     assert panel.items[a].isSelected()
     fridge = window.fridge_panel.store
-    fridge.unassign(a10); panel.refresh_connections(); assert '未分配' in labels(a)
+    assert panel.hide_unassigned.isEnabled()
+    panel.hide_unassigned.trigger()
+    assert set(panel.items) == {a, b}
+    assert panel.matches.findData(below) == -1
+    fridge.unassign(a10); panel.refresh_connections()
+    assert set(panel.items) == {b}
+    assert panel.selected is None and not panel.edit_button.isEnabled()
+    panel.smart_wiring.setChecked(False)
+    assert set(panel.items) == {b}
+    panel.smart_wiring.setChecked(True)
+    panel.hide_unassigned.trigger()
+    assert set(labels(a)) == {ports[0]['number'], 'Q1', '未分配'}
+    empty_number = panel.ports[below]['number']
+    assert set(labels(below)) == {empty_number}
+    assert panel.items[below].brush().color().value() < 64
+    assert captions(below)[empty_number].brush().color().value() > 192
+    assert 'FO4 / 3' in labels(b)
+    panel.smart_wiring.setChecked(False)
+    assert 'Q1' in labels(a)
     window.close(); app.processEvents()
+
+
+def test_sample_box_wiring_table_exports_inner_rings_first(tmp_path, monkeypatch):
+    from openpyxl import load_workbook
+
+    app = QApplication.instance() or QApplication([])
+    sample = tmp_path / 'chip.qchip'
+    project = tmp_path / 'fridge.qfridge'
+    with ChipStore.create(sample, '样品') as chip:
+        chip.enable_sample_box('lab-56')
+        ports = {port['number']: port for port in chip.sample_box_ports()}
+        device = chip.add_device('qubit', 'fixed_transmon', 'Q1', 0, 0)
+        chip.save_sample_box_port(ports['6']['id'], '6', True, device, signal_name='Q1-XY')
+        unwired_device = chip.add_device('qubit', 'fixed_transmon', 'Q2', 1, 0)
+        chip.save_sample_box_port(ports['9']['id'], '9', True, unwired_device, signal_name='Q2-XY')
+    with closing(FridgeStore.create(project, 'DR', with_preset=True)) as fridge:
+        sample_id = fridge.add_sample(sample)
+        fridge_ports = {(port['board'], port['number']): port['id'] for port in fridge.ports()}
+        fridge.assign(fridge_ports['A', '6'], sample_id, box_port_id=ports['14']['id'])
+        fridge.assign(fridge_ports['A', '5'], sample_id, box_port_id=ports['51']['id'])
+        fridge.assign(fridge_ports['F', 'O4'], sample_id, box_port_id=ports['6']['id'], branch='3')
+
+    window = gui.MainWindow(str(sample))
+    try:
+        window._open_fridge_path(str(project))
+        panel = window.sample_box_panel
+        window.tabs.setCurrentWidget(panel)
+        panel.hide_unassigned.setChecked(True)
+        panel.rotate_right.click()
+        image_action, table_action = panel.export_button.menu().actions()
+        assert [image_action.text(), table_action.text()] == ['导出样品盒图片', '导出接线表']
+        assert set(panel.items) == {ports[number]['id'] for number in ('6', '51', '14')}
+
+        paths = ((tmp_path / 'wiring.xlsx', 'Excel (*.xlsx)'), (tmp_path / 'wiring', 'CSV (*.csv)'))
+        for path, file_filter in paths:
+            monkeypatch.setattr(sample_box_ui.QFileDialog, 'getSaveFileName', lambda *_: (str(path), file_filter))
+            table_action.trigger()
+        workbook = load_workbook(tmp_path / 'wiring.xlsx', read_only=True)
+        try:
+            headers, *rows = workbook['样品盒接线'].values
+            assert headers == ('圈序', '样品盒接口', '制冷机端口', '信号名称', '元件')
+            assert rows == [(1, '6', 'FO4 / 3', 'Q1-XY', 'Q1'), (1, '51', 'A5', None, None),
+                            (3, '14', 'A6', None, None)]
+            with (tmp_path / 'wiring.csv').open(encoding='utf-8-sig', newline='') as stream:
+                csv_rows = list(csv.reader(stream))
+            assert csv_rows == [list(headers)] + [['' if value is None else str(value) for value in row] for row in rows]
+        finally:
+            workbook.close()
+    finally:
+        window.close(); app.processEvents()

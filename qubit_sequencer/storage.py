@@ -407,14 +407,59 @@ class ChipStore(AttachmentStore, DesignStore, WiringStore, ReadoutStore, SampleB
             return self.db.execute("SELECT * FROM devices WHERE kind=? ORDER BY label", (kind,)).fetchall()
         return self.db.execute("SELECT * FROM devices ORDER BY kind,label").fetchall()
 
+    @undoable("移动元件")
+    def move_devices(self, ids, dx: float, dy: float) -> None:
+        if not all(map(math.isfinite, (dx, dy))):
+            raise ValueError("移动距离必须为有限数值")
+        if not (dx or dy):
+            return
+        with self.db:
+            self.db.execute("BEGIN IMMEDIATE")
+            moving = {ident: self.device(ident) for ident in ids}
+            devices = self.devices()
+            positions = {(d["x"], d["y"]) for d in devices if d["kind"] == "qubit" and d["id"] not in moving}
+            for device in moving.values():
+                if device["kind"] == "qubit" and (device["x"] + dx, device["y"] + dy) in positions:
+                    raise ValueError("目标位置已有比特")
+
+            anchored = {link["device_id"]: link for link in self.readout_links() if link["position"] is not None}
+            self.db.executemany("UPDATE devices SET x=x+?,y=y+? WHERE id=?",
+                                ((dx, dy, ident) for ident in moving if ident not in anchored))
+            update_routes = any(device["kind"] in ("qubit", "coupler") for device in moving.values())
+            for device in devices:
+                if device["kind"] == "readout" and (update_routes or device["id"] in moving):
+                    self._move_readout_filters(device["id"])
+            sliding = []
+            for ident, original in moving.items():
+                link = anchored.get(ident)
+                if link is None or link["readout_id"] in moving:
+                    continue
+                readout = self.device(link["readout_id"])
+                x, y = original["x"] + original["dx"] + dx, original["y"] + original["dy"] + dy
+                position, _ = project_to_readout(readout, x, y)
+                # Move the leading filters first so their previous positions
+                # do not block other selected filters on the same line.
+                order = -link["position"] if position >= link["position"] else link["position"]
+                sliding.append((order, ident, link, readout, position))
+            for _, ident, link, readout, position in sorted(sliding, key=lambda entry: entry[0]):
+                position = self._available_filter_position(readout, position, ident)
+                x, y = readout_point(readout, position, self.devices())
+                self.db.execute("UPDATE readout_links SET position=? WHERE id=?", (position, link["id"]))
+                self.db.execute("UPDATE devices SET x=?,y=?,dx=0,dy=0 WHERE id=?", (x, y, ident))
+
     @undoable("删除器件")
     def delete_device(self, ident: str) -> None:
-        old = self.device(ident)
+        self.delete_devices((ident,))
+
+    @undoable("批量删除元件")
+    def delete_devices(self, ids) -> None:
         with self.db:
-            self.db.execute("DELETE FROM devices WHERE id=?", (ident,))
-            if old["kind"] == "coupler":
-                self.db.execute("DELETE FROM meta WHERE key=?", (f"coupler_auto_name.{ident}",))
-            if old["kind"] in ("qubit", "coupler"):
+            self.db.execute("BEGIN IMMEDIATE")
+            devices = [self.device(ident) for ident in ids]
+            self.db.executemany("DELETE FROM devices WHERE id=?", ((device["id"],) for device in devices))
+            self.db.executemany("DELETE FROM meta WHERE key=?", ((f"coupler_auto_name.{device['id']}",)
+                                for device in devices if device["kind"] == "coupler"))
+            if any(device["kind"] in ("qubit", "coupler") for device in devices):
                 for readout in self.devices("readout"):
                     self._move_readout_filters(readout["id"])
 

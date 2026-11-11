@@ -204,6 +204,8 @@ class WorkbenchLayout:
                 self.add_component_menu.addAction(action)
             action.toggled.connect(lambda checked, chosen=action: self._sync_mode(chosen, checked))
         modes_layout.insertWidget(1, self.add_component_button)
+        self.quick_wiring_button = self._tool_button("快捷接线", self.quick_wiring, "connect")
+        modes_layout.addWidget(self.quick_wiring_button)
         layer = QWidget(); layer_layout = QHBoxLayout(layer)
         layer_layout.setContentsMargins(0, 0, 0, 0); layer_layout.setSpacing(8)
         self.connection_mode = QComboBox(); self.connection_mode.addItem("直接电容", "direct")
@@ -482,7 +484,10 @@ class WorkbenchLayout:
         dirty = selected and self.drafts.dirty(*self.selected)
         self.save_button.setEnabled(bool(dirty)); self.reset_button.setEnabled(bool(dirty)); self.custom_button.setEnabled(selected)
         self.custom_button.setEnabled(selected and self.selected[0] != "readout_link")
-        self.delete_action.setEnabled(selected and self.tabs.currentWidget() is self.topology_page and showing_topology)
+        device_count = len(self.topology_device_selection())
+        self.delete_action.setEnabled(bool(selected or device_count) and self.tabs.currentWidget() is self.topology_page and showing_topology)
+        if device_count > 1:
+            self.delete_action.setText(f"删除所选 {device_count} 个元件")
         count = len(self.drafts.dirty_keys()) if opened else 0
         self.draft_status.setText(f"{count} 项未保存" if count else "")
         line_selected = bool(opened and self._chosen_line_id())

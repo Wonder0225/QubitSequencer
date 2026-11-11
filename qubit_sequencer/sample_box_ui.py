@@ -7,13 +7,14 @@ from PySide6.QtGui import QColor, QBrush, QDesktopServices, QFont, QFontMetrics,
 from PySide6.QtSvg import QSvgGenerator
 from PySide6.QtWidgets import (
     QCheckBox, QComboBox, QDialog, QDialogButtonBox, QFileDialog, QFormLayout, QGraphicsItem, QGraphicsScene,
-    QHBoxLayout, QLabel, QLineEdit, QMessageBox, QPushButton, QSplitter, QVBoxLayout, QWidget,
+    QHBoxLayout, QLabel, QLineEdit, QMenu, QMessageBox, QPushButton, QSplitter, QVBoxLayout, QWidget,
 )
 
 from .device_types import DEVICE_NAMES
+from .exports import export_sample_box_wiring
 from .fridge_circuit_ui import component_text
 from .fridge_ui import PortView
-from .sample_box_store import BOX_ROLES, box_number_source
+from .sample_box_store import BOX_ROLES, box_connection_label, box_number_source
 from .sample_box_templates import DEFAULT_TEMPLATE, load_sample_box_templates
 from .theme import DIAGRAM_COLORS, UI_COLORS, custom_device_colors
 from .undo_ui import install_form_undo
@@ -23,6 +24,17 @@ from .ui_icons import icon
 def sample_box_template_directory():
     root = QStandardPaths.writableLocation(QStandardPaths.StandardLocation.GenericDataLocation)
     return Path(root) / "QubitSequencer" / "sample-box-templates"
+
+
+def _fit_label(label, width, height):
+    """Fit a single line inside its allotted space and return its scene size."""
+    font = label.font()
+    font.setPixelSize(max(1, round(height)))
+    label.setFont(font)
+    bounds = label.boundingRect()
+    scale = min(width / max(1, bounds.width()), height / bounds.height())
+    label.setScale(scale)
+    return bounds.width() * scale, bounds.height() * scale
 
 
 class BoxPortDialog(QDialog):
@@ -99,19 +111,38 @@ class SampleBoxPanel(QWidget):
         self.matches = QComboBox(); self.matches.setMinimumWidth(135); bar.addWidget(self.matches)
         self.search.textChanged.connect(self.refresh_matches)
         self.matches.currentIndexChanged.connect(self.locate_match)
-        self.show_names = QCheckBox("显示元件名称"); self.show_names.setChecked(True)
-        self.show_names.toggled.connect(self.draw_panel); bar.addWidget(self.show_names)
-        self.smart_wiring = QCheckBox("智能接线"); self.smart_wiring.setToolTip("显示当前制冷机项目中的端口和开关分支")
-        self.smart_wiring.toggled.connect(self.change_wiring_mode); bar.addWidget(self.smart_wiring)
+        self.display_button = QPushButton("显示选项")
+        display_menu = QMenu(self.display_button)
+        display_menu.setToolTipsVisible(True)
+        self.display_button.setMenu(display_menu)
+        bar.addWidget(self.display_button)
+        self.show_names = display_menu.addAction("显示元件名称")
+        self.show_names.setCheckable(True)
+        self.show_names.setChecked(True)
+        self.show_names.toggled.connect(self.draw_panel)
+        self.smart_wiring = display_menu.addAction("智能接线")
+        self.smart_wiring.setCheckable(True)
+        self.smart_wiring.setToolTip("显示当前制冷机项目中的端口和开关分支")
+        self.smart_wiring.toggled.connect(self.change_wiring_mode)
+        self.hide_unassigned = display_menu.addAction("隐去未分配")
+        self.hide_unassigned.setCheckable(True)
+        self.hide_unassigned.setEnabled(False)
+        self.hide_unassigned.setToolTip("关联制冷机项目后，只显示已分配制冷机线路的接口")
+        self.hide_unassigned.toggled.connect(self.refresh_display)
         self.rotate_left = QPushButton("逆时针 90°"); self.rotate_left.clicked.connect(lambda: self.rotate_box(-90))
         self.rotate_right = QPushButton("顺时针 90°"); self.rotate_right.clicked.connect(lambda: self.rotate_box(90))
         for button, symbol in ((self.rotate_left, "undo"), (self.rotate_right, "redo")):
             button.setIcon(icon(symbol, UI_COLORS[self.host.theme]["text"]))
             self.host._icon_bindings.append((button, symbol)); bar.addWidget(button)
         self.fit = QPushButton("适配视图"); self.fit.clicked.connect(self.fit_map); bar.addWidget(self.fit)
-        export = QPushButton("导出图面"); export.setIcon(icon("export", UI_COLORS[self.host.theme]["text"]))
-        self.host._icon_bindings.append((export, "export")); export.clicked.connect(self.export_dialog); bar.addWidget(export)
-        self.export_button = export
+        self.export_button = QPushButton("导出样品盒")
+        self.export_button.setIcon(icon("export", UI_COLORS[self.host.theme]["text"]))
+        self.host._icon_bindings.append((self.export_button, "export"))
+        export_menu = QMenu(self.export_button)
+        export_menu.addAction("导出样品盒图片", self.export_dialog)
+        export_menu.addAction("导出接线表", self.export_table_dialog)
+        self.export_button.setMenu(export_menu)
+        bar.addWidget(self.export_button)
 
         splitter = QSplitter(); layout.addWidget(splitter, 1)
         self.view = PortView(); self.scene = QGraphicsScene(self); self.view.setScene(self.scene)
@@ -145,11 +176,8 @@ class SampleBoxPanel(QWidget):
         self.update_template_action()
         self.search.setEnabled(bool(self.ports)); self.fit.setEnabled(bool(self.ports))
         self.rotate_left.setEnabled(bool(self.ports)); self.rotate_right.setEnabled(bool(self.ports))
-        self.smart_wiring.setEnabled(bool(self.ports)); self.export_button.setEnabled(bool(self.ports))
+        self.display_button.setEnabled(bool(self.ports)); self.export_button.setEnabled(bool(self.ports))
         self.refresh_connections()
-        self.draw_panel()
-        self.refresh_matches()
-        self.show_port()
         if old_store is not self.store or self.view._fit_active:
             self.fit_map()
 
@@ -166,8 +194,13 @@ class SampleBoxPanel(QWidget):
                 self.connections_available = True
                 self.connections = {row["box_port_id"]: row for row in fridge.store.box_connections(sample["id"])}
                 self.connection_state = f"制冷机：{fridge.store.name()} · 已连接 {len(self.connections)} 个接口"
+        self.hide_unassigned.setEnabled(bool(self.ports) and self.connections_available)
+        self.refresh_display()
+
+    def refresh_display(self):
+        self.draw_panel()
+        self.refresh_matches()
         self.show_port()
-        if self.smart_wiring.isChecked(): self.draw_panel()
 
     def change_wiring_mode(self, *_):
         self.draw_panel(); self.fit_map()
@@ -187,7 +220,10 @@ class SampleBoxPanel(QWidget):
                 outline.lineTo(x, y)
             outline.closeSubpath()
             center = outline.boundingRect().center()
-            spread = 1.65 if self.smart_wiring.isChecked() else 1.0
+            smart_wiring = self.smart_wiring.isChecked()
+            show_names = self.show_names.isChecked()
+            hide_unassigned = self.connections_available and self.hide_unassigned.isChecked()
+            spread = 1.65 if smart_wiring else 1.0
             rotation = QTransform().translate(center.x(), center.y()).rotate(self.rotation).scale(spread, spread).translate(-center.x(), -center.y())
             outline = rotation.map(outline)
             self.scene.addPath(outline, QPen(QColor(ui["border"]), 2), QBrush(QColor(ui["panel"])))
@@ -200,16 +236,30 @@ class SampleBoxPanel(QWidget):
                                       QPen(QColor(ui["border"])), QBrush(QColor(colors["paper"])))
             origin_x, origin_y = drawing["origin"]
             pitch, radius = drawing["pitch"], drawing["radius"]
+            # Rotation is in 90-degree steps, so the grid spacing applies on both axes.
+            spacing = pitch * spread
+            gap = min(2, spacing * .03)
+            caption_width = spacing - 2 * gap
+            caption_bottom = spacing - radius - gap
             fill = {"qubit": colors["x_check"], "coupler": colors["coupler"], "readout": colors["data"],
                     "filter": colors["z_check"]}
             custom_colors = custom_device_colors(device["subtype"] for device in self.store.devices("custom"))
             for ident, port in self.ports.items():
+                connection = self.connections.get(ident)
+                if hide_unassigned and connection is None:
+                    continue
+                empty_port = (smart_wiring and self.connections_available
+                              and connection is None and not port["device_id"])
                 x, y = origin_x + port["x"] * pitch, origin_y + port["y"] * pitch
                 point = rotation.map(QPointF(x, y)); x, y = point.x(), point.y()
                 inferred = port["source"] == "inferred" and not port["verified"]
                 pen = QPen(QColor(colors["muted"]), 1.6, Qt.PenStyle.DashLine if inferred else Qt.PenStyle.SolidLine)
                 subtype = port["device_subtype"] if port["device_kind"] == "custom" else ""
                 color = custom_colors[subtype] if subtype else fill.get(port["device_kind"], colors["paper"])
+                number_color = "#15181E" if port["device_kind"] else colors["ink"]
+                if empty_port:
+                    color = DIAGRAM_COLORS["dark"]["paper"]
+                    number_color = DIAGRAM_COLORS["dark"]["ink"]
                 brush = QBrush(QColor(color))
                 item = self.scene.addEllipse(-radius, -radius, radius*2, radius*2, pen, brush)
                 item.setPos(x, y); item.setData(0, ident)
@@ -219,35 +269,50 @@ class SampleBoxPanel(QWidget):
                 item.setToolTip(f"接口 {port['number']} · {box_number_source(port)}" + (f"\n关联元件：{name}" if name else "")
                                 + (f"\n类型：{subtype}" if subtype else ""))
                 label = self.scene.addSimpleText(port["number"]); label.setParentItem(item)
-                label.setBrush(QColor("#15181E" if port["device_kind"] else colors["ink"]))
+                label.setBrush(QColor(number_color))
                 label.setAcceptedMouseButtons(Qt.MouseButton.NoButton)
-                rect = label.boundingRect(); label.setPos(-rect.width()/2, -rect.height()/2)
-                if name and self.show_names.isChecked():
-                    font = QFont(); font.setPixelSize(max(8, min(11, int(pitch - 2 * radius - 3))))
-                    text = QFontMetrics(font).elidedText(name, Qt.TextElideMode.ElideRight, max(1, int(pitch - 4)))
-                    caption = self.scene.addSimpleText(text); caption.setParentItem(item); caption.setFont(font)
+                number_bounds = label.boundingRect()
+                number_width, number_height = number_bounds.width(), number_bounds.height()
+                if smart_wiring:
+                    number_width, number_height = _fit_label(label, 1.3 * radius, 1.3 * radius)
+                label.setPos(-number_width / 2, -number_height / 2)
+                caption_top = radius + gap
+                if name and show_names:
+                    if smart_wiring:
+                        caption = self.scene.addSimpleText(name); caption.setParentItem(item)
+                        name_height = (caption_bottom - caption_top - gap) / 2
+                        width, height = _fit_label(caption, caption_width, name_height)
+                        caption.setPos(-width / 2, caption_top)
+                        caption_top += height + gap
+                    else:
+                        font = QFont(); font.setPixelSize(max(8, min(11, int(pitch - 2 * radius - 3))))
+                        text = QFontMetrics(font).elidedText(name, Qt.TextElideMode.ElideRight, max(1, int(pitch - 4)))
+                        caption = self.scene.addSimpleText(text); caption.setParentItem(item); caption.setFont(font)
+                        caption.setPos(-caption.boundingRect().width() / 2, radius + 1)
                     caption.setBrush(QColor(colors["ink"])); caption.setToolTip(name)
                     caption.setAcceptedMouseButtons(Qt.MouseButton.NoButton)
-                    bounds = caption.boundingRect(); caption.setPos(-bounds.width() / 2, radius + 1)
                 self.items[ident] = item
-                if self.smart_wiring.isChecked():
-                    connection = self.connections.get(ident)
-                    target = (f"{connection['board']}{connection['number']}" +
-                              (f" / {connection['branch']}" if connection['branch'] is not None else "")) if connection else ("未分配" if self.connections_available else "未知")
+                if smart_wiring and not empty_port:
+                    if connection:
+                        target = box_connection_label(connection)
+                    else:
+                        target = "未分配" if self.connections_available else "未知"
                     item.setToolTip(item.toolTip() + f"\n制冷机：{target}")
-                    font = QFont(); font.setPixelSize(11); font.setBold(bool(connection))
+                    font = QFont(); font.setBold(bool(connection))
                     caption = self.scene.addSimpleText(target); caption.setParentItem(item); caption.setFont(font)
                     caption.setBrush(QColor(ui["text"] if connection else ui["muted"]))
                     caption.setAcceptedMouseButtons(Qt.MouseButton.NoButton)
                     caption.setToolTip(f"制冷机端口：{target}")
-                    rect = caption.boundingRect()
-                    caption.setPos(-rect.width() / 2, radius + (15 if name and self.show_names.isChecked() else 2))
-            if self.smart_wiring.isChecked():
+                    width, _ = _fit_label(caption, caption_width, caption_bottom - caption_top)
+                    caption.setPos(-width / 2, caption_top)
+            if smart_wiring:
                 bounds = outline.boundingRect()
                 heading = self.scene.addSimpleText(f"智能接线 · {self.store.meta()['chip_name']} · {self.connection_state}")
                 font = heading.font(); font.setPixelSize(16); font.setBold(True); heading.setFont(font)
                 heading.setBrush(QColor(ui["text"])); heading.setPos(bounds.left(), bounds.top() - 35)
                 heading.setAcceptedMouseButtons(Qt.MouseButton.NoButton)
+        if self.selected not in self.items:
+            self.selected = None
         self.scene.blockSignals(False)
         self.scene.setSceneRect(self.scene.itemsBoundingRect().adjusted(-18, -18, 18, 18))
 
@@ -257,12 +322,23 @@ class SampleBoxPanel(QWidget):
             self.draw_panel(); self.fit_map()
 
     def export_dialog(self):
-        path, selected = QFileDialog.getSaveFileName(self, "导出样品盒图面", "样品盒接线.png", "PNG 图片 (*.png);;SVG 图片 (*.svg);;PDF 文档 (*.pdf)")
+        path, selected = QFileDialog.getSaveFileName(self, "导出样品盒图片", "样品盒接线.png", "PNG 图片 (*.png);;SVG 图片 (*.svg);;PDF 文档 (*.pdf)")
         if not path: return
         if not Path(path).suffix:
             path += ".pdf" if "PDF" in selected else ".svg" if "SVG" in selected else ".png"
         try:
             self.export_scene(path)
+        except (OSError, ValueError) as exc:
+            QMessageBox.warning(self, "导出失败", str(exc))
+
+    def export_table_dialog(self):
+        path, selected = QFileDialog.getSaveFileName(self, "导出接线表", "样品盒接线表.xlsx", "Excel (*.xlsx);;CSV (*.csv)")
+        if not path:
+            return
+        if not Path(path).suffix:
+            path += ".csv" if "CSV" in selected else ".xlsx"
+        try:
+            export_sample_box_wiring(self.store, path, self.connections)
         except (OSError, ValueError) as exc:
             QMessageBox.warning(self, "导出失败", str(exc))
 
@@ -307,7 +383,8 @@ class SampleBoxPanel(QWidget):
         query = self.search.text().strip().casefold()
         self.matches.blockSignals(True); self.matches.clear()
         self.matches.addItem("选择接口", None)
-        for ident, port in self.ports.items():
+        for ident in self.items:
+            port = self.ports[ident]
             name = port["device_label"] or ""
             terms = (port["number"], name, name.replace("{", "").replace("}", "").replace("_", ""), port["signal_name"])
             if not query or any(query in term.casefold() for term in terms):

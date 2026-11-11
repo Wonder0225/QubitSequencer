@@ -1,4 +1,4 @@
-# Qubit Sequencer 0.4.3 · Windows 桌面版
+# Qubit Sequencer 0.4.4 · Windows 桌面版
 
 完整解压后双击 `QubitSequencer.exe`。请保持 EXE、`_internal` 及其他文件的相对位置。打开 `examples/surface_d3_complete.qchip` 可查看完整 d=3 旋转表面码项目；其中的参数、工作点和接线均为模拟数据。
 

@@ -1,9 +1,10 @@
 from PySide6.QtCore import QPoint, QPointF, Qt, QEvent
-from PySide6.QtGui import QMouseEvent
+from PySide6.QtGui import QContextMenuEvent, QMouseEvent
 from PySide6.QtTest import QTest
-from PySide6.QtWidgets import QApplication, QGraphicsItem, QGraphicsScene
+from PySide6.QtWidgets import QApplication, QGraphicsItem, QGraphicsScene, QMessageBox
 
 from qubit_sequencer import gui
+from qubit_sequencer.diagram import CELL
 from qubit_sequencer.fridge_ui import PortView
 from qubit_sequencer.storage import ChipStore
 
@@ -47,6 +48,78 @@ def test_chip_rubber_band_selects_devices(tmp_path):
     drag(view, view.mapFromScene(bounds.topLeft()), view.mapFromScene(bounds.bottomRight()), Qt.MouseButton.LeftButton)
     assert {item.data(0)[1] for item in scene.selectedItems() if item.data(0)} == {a, b}
     window.close(); app.processEvents()
+
+
+def test_chip_drags_and_deletes_selected_devices_as_a_group(tmp_path, monkeypatch):
+    app = QApplication.instance() or QApplication([])
+    path = tmp_path / 'chip.qchip'
+    with ChipStore.create(path, 'chip') as chip:
+        a = chip.add_device('qubit', 'fixed_transmon', 'Q1', 0, 0)
+        b = chip.add_device('qubit', 'fixed_transmon', 'Q2', 1, 0)
+        other = chip.add_device('qubit', 'fixed_transmon', 'Q3', 3, 0)
+        coupling = chip.add_coupling(a, b)
+    window = gui.MainWindow(str(path)); window.show(); app.processEvents()
+    errors = []
+    monkeypatch.setattr(window, '_error', lambda title, exc: errors.append((title, str(exc))))
+    try:
+        view = window.view
+        bounds = window.scene._device_items[a].sceneBoundingRect().united(window.scene._device_items[b].sceneBoundingRect())
+        bounds = bounds.adjusted(-20, -20, 20, 20)
+        drag(view, view.mapFromScene(bounds.topLeft()), view.mapFromScene(bounds.bottomRight()), Qt.MouseButton.LeftButton)
+        assert set(window.topology_device_selection()) == {a, b}
+
+        def move_one_grid():
+            center = window.scene._device_items[a].sceneBoundingRect().center()
+            drag(view, view.mapFromScene(center), view.mapFromScene(center + QPointF(CELL, 0)), Qt.MouseButton.LeftButton)
+
+        move_one_grid()
+        assert [window.store.device(ident)['x'] for ident in (a, b, other)] == [1, 2, 3]
+        assert set(window.topology_device_selection()) == {a, b}
+        assert len(window.undo_history.steps) == 1
+        move_one_grid()
+        assert errors == [('移动失败', '目标位置已有比特')]
+        assert [window.store.device(ident)['x'] for ident in (a, b, other)] == [1, 2, 3]
+        assert len(window.undo_history.steps) == 1
+        window.undo_edit()
+        assert [window.store.device(ident)['x'] for ident in (a, b)] == [0, 1]
+        window.redo_edit()
+        assert [window.store.device(ident)['x'] for ident in (a, b)] == [1, 2]
+
+        point = view.mapFromScene(window.scene._device_items[a].sceneBoundingRect().center())
+        context = QContextMenuEvent(QContextMenuEvent.Reason.Mouse, point, view.viewport().mapToGlobal(point))
+        app.sendEvent(view.viewport(), context)
+        assert window.detail_menu.isVisible()
+        assert window.delete_action.text() == '删除所选 2 个元件'
+        window.detail_menu.close()
+        monkeypatch.setattr(QMessageBox, 'question', lambda *_: QMessageBox.StandardButton.Yes)
+        view.setFocus()
+        QTest.keyClick(view, Qt.Key.Key_Delete)
+        app.processEvents()
+        assert [device['id'] for device in window.store.devices()] == [other]
+        assert window.store.couplings() == []
+        window.undo_edit()
+        assert window.store.coupling(coupling)['qubit_a'] in (a, b)
+        window.redo_edit()
+        assert [device['id'] for device in window.store.devices()] == [other]
+    finally:
+        window.close(); app.processEvents()
+
+
+def test_chip_group_move_preserves_filter_anchor(tmp_path):
+    with ChipStore.create(tmp_path / 'chip.qchip', 'chip') as chip:
+        readout = chip.add_device('readout', 'readout_line', 'R1', 2, 0, readout_endpoints=((0, 0), (4, 0)))
+        tunable_filter = chip.add_device('filter', 'tunable_filter', 'F1', 1, 0)
+        link = chip.add_readout_link(readout, tunable_filter, position=.25)
+        second_filter = chip.add_device('filter', 'tunable_filter', 'F2', 2, 0)
+        second_link = chip.add_readout_link(readout, second_filter, position=.5)
+        chip.move_devices((readout, tunable_filter), 2, 1)
+        assert chip.readout_link(link)['position'] == .25
+        assert tuple(chip.device(tunable_filter)[axis] for axis in ('x', 'y')) == (3, 1)
+        assert tuple(chip.device(second_filter)[axis] for axis in ('x', 'y')) == (4, 1)
+        chip.move_devices((tunable_filter, second_filter), 1, 1)
+        assert chip.readout_link(link)['position'] == .5
+        assert chip.readout_link(second_link)['position'] == .75
+        assert tuple(chip.device(tunable_filter)[axis] for axis in ('x', 'y')) == (4, 1)
 
 
 def test_design_marker_selection_and_pan():
@@ -137,3 +210,54 @@ def test_batch_status_preserves_allocations(tmp_path):
     row = next(row for ident, branch, row in store.table_entries()[1] if ident == ids[0])
     assert row[headers.index('占用状态')] == '已占用'
     history.detach(); store.close()
+
+
+def test_fridge_batch_unassign_preserves_protected_branches_and_undo(tmp_path, monkeypatch):
+    from PySide6.QtWidgets import QMessageBox
+    from qubit_sequencer.fridge_ui import FridgePanel
+    from qubit_sequencer.fridge_store import FridgeStore
+    app = QApplication.instance() or QApplication([])
+    chip_path = tmp_path / 'chip.qchip'
+    with ChipStore.create(chip_path, 'sample') as chip:
+        device = chip.add_device('qubit', 'fixed_transmon', 'Q', 0, 0)
+    store = FridgeStore.create(tmp_path / 'f.qfridge', 'DR', with_preset=True)
+    sid = store.add_sample(chip_path)
+    switch = next(p['id'] for p in store.ports() if p['board'] == 'F' and p['number'] == 'O4')
+    other = next(p['id'] for p in store.ports() if p['board'] == 'F' and p['number'] == 'O3')
+    store.assign(switch, sid, devices=[device], branch='1'); store.assign(switch, sid, devices=[device], branch='2')
+    store.assign(other, sid, devices=[device]); store.set_branch_occupied(switch, '2', True)
+    panel = FridgePanel(store); panel.show(); panel.open_board('F'); app.processEvents()
+    for item in panel.scene.items():
+        if hasattr(item, 'port') and item.port['id'] in (switch, other): item.setSelected(True)
+    app.processEvents(); assert panel.port_buttons[1].isEnabled()
+    prompts = []
+    def approve(*args):
+        prompts.append(args[2]); return QMessageBox.StandardButton.Yes
+    monkeypatch.setattr(QMessageBox, 'question', approve)
+    panel.unassign(); app.processEvents()
+    assert '分支 2' in prompts[0] and '跳过' in prompts[0]
+    assert store.port(other)['sample_id'] is None
+    assert [row['branch'] for row in store.branch_assignments(switch)] == ['2']
+    assert store.branch_marks(switch) == {'2'}
+    assert store.circuit(switch)['switch'] == ['1', '2', '3', '4', '5', '6']
+    panel.undo(); assert store.port(other)['sample_id'] == sid
+    assert {r['branch'] for r in store.branch_assignments(switch)} == {'1', '2'}
+    panel.redo(); assert store.port(other)['sample_id'] is None
+    panel.close(); app.processEvents()
+
+
+def test_fridge_rubber_band_batch_status(tmp_path):
+    from qubit_sequencer.fridge_ui import FridgePanel
+    from qubit_sequencer.fridge_store import FridgeStore
+    app = QApplication.instance() or QApplication([])
+    store = FridgeStore.create(tmp_path / 'f.qfridge', 'DR')
+    panel = FridgePanel(store); panel.resize(1200, 800); panel.show(); panel.open_board('F'); panel.fit_map(); app.processEvents()
+    items = [item for item in panel.scene.items() if hasattr(item, 'port') and item.port['number'] in ('O1', 'O2')]
+    rect = items[0].sceneBoundingRect().united(items[1].sceneBoundingRect()).adjusted(-6, -6, 6, 6)
+    drag(panel.graphics, panel.graphics.mapFromScene(rect.topLeft()), panel.graphics.mapFromScene(rect.bottomRight()), Qt.MouseButton.LeftButton)
+    ids = {item.port['id'] for item in items}
+    assert set(panel.selected_port_ids()) == ids
+    panel.occupied.setCurrentIndex(panel.occupied.findData('occupied'))
+    assert all(store.port(ident)['manual_status'] == 'occupied' for ident in ids)
+    panel.undo(); assert all(not store.port(ident)['manual_status'] for ident in ids)
+    panel.close(); app.processEvents()

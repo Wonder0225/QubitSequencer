@@ -382,6 +382,7 @@ class FridgePanel(QWidget):
     def __init__(self, store, parent=None, host=None, preview=False):
         super().__init__(parent); self.store = store; self.host = host; self.selected = None
         self.preview = preview; self.selected_branch = None
+        self._selection_order = []
         self._closed = False; self._fitting = False; self.placing_port = False
         self.sample_watcher = QFileSystemWatcher(self)
         self.sample_refresh_timer = QTimer(self); self.sample_refresh_timer.setSingleShot(True)
@@ -497,6 +498,9 @@ class FridgePanel(QWidget):
             self.host._update_undo_action()
             if self.host.fridge_panel is self and self.host.tabs.is_page_visible(self.host.sample_box_panel):
                 self.host.sample_box_panel.refresh_connections()
+            if (self.host.fridge_panel is self and self.host.store and self.host.scene and
+                    (self.host.field_combo.currentData() or '').startswith('wiring.')):
+                self.host.refresh_scene()
 
     def is_overview(self):
         return not self.board.currentData()
@@ -574,6 +578,9 @@ class FridgePanel(QWidget):
                    True, bool(selected), bool(selected and not locked), bool(selected))
         for button, allowed in zip(self.port_buttons, enabled):
             button.setEnabled(editable and allowed and (not multiple or button is self.port_buttons[3]))
+        if multiple:
+            removable, _ = self.store.unassign_preview(self.selected_port_ids())
+            self.port_buttons[1].setEnabled(editable and bool(removable))
 
     def perform(self, operation):
         try:
@@ -728,7 +735,11 @@ class FridgePanel(QWidget):
 
     def selected_port_ids(self):
         if self.views.currentIndex() != 0: return []
-        return [item.port["id"] for item in self.scene.selectedItems() if isinstance(item, PortItem)]
+        items = {item.port["id"]: item for item in self.scene.selectedItems() if isinstance(item, PortItem)}
+        self._selection_order = [ident for ident in self._selection_order if ident in items]
+        added = set(items) - set(self._selection_order)
+        self._selection_order.extend(sorted(added, key=lambda ident: (items[ident].scenePos().y(), items[ident].scenePos().x(), ident)))
+        return list(self._selection_order)
 
     def canvas_selection_changed(self):
         if self._closed or self.views.currentIndex() != 0: return
@@ -744,7 +755,7 @@ class FridgePanel(QWidget):
     def show_multiple_selection(self):
         ids = self.selected_port_ids()
         self.info.setText(f"已选择 {len(ids)} 个端口；选择状态可批量设置。")
-        self.circuit_info.setText("批量设置不改变已有样品分配或图纸编号。")
+        self.circuit_info.setText("批量设置不改变已有样品分配或图纸编号；可点击解除分配批量处理。")
         self.occupied.blockSignals(True); self.occupied.setCurrentIndex(-1)
         self.occupied.setPlaceholderText("选择要批量设置的状态"); self.occupied.blockSignals(False)
 
@@ -937,6 +948,25 @@ class FridgePanel(QWidget):
 
     def unassign(self):
         if self.preview or self.is_overview(): return
+        ids = self.selected_port_ids()
+        if len(ids) > 1:
+            removable, protected = self.store.unassign_preview(ids)
+            if not removable:
+                QMessageBox.information(self, "批量解除分配", "所选端口没有可解除的分配；手动占用或损坏的端口及分支会保留。")
+                return
+            def describe(row):
+                branch = f" / 分支 {row['branch']}" if row['branch'] is not None else ""
+                return f"{row['board']}{row['number']}{branch} · {row['sample']}"
+            message = f"将解除 {len(removable)} 条样品分配：\n" + "\n".join(describe(row) for row in removable)
+            if protected:
+                message += f"\n\n{len(protected)} 条受手动占用或损坏标记保护，将跳过：\n" + "\n".join(describe(row) for row in protected)
+            if any(row["legacy"] for row in removable):
+                message += "\n\n其中包含迁移原记录，解除时会一并移除，可通过撤回恢复。"
+            message += "\n\n物理低温线路和手动标记会保留。继续？"
+            if QMessageBox.question(self, "批量解除分配", message, QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                                    QMessageBox.StandardButton.No) == QMessageBox.StandardButton.Yes:
+                self.perform(lambda: self.store.unassign_many([(row["port_id"], row["branch"]) for row in removable]))
+            return
         p = self.chosen()
         if not p or not p["sample_id"]: return
         branch = self.choose_branch(p, assigned_only=True)

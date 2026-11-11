@@ -2,7 +2,7 @@ param([switch]$SkipLocalPublish)
 
 $ErrorActionPreference = 'Stop'
 $projectRoot = (Resolve-Path (Join-Path $PSScriptRoot '..')).Path
-$releaseVersion = '0.4.3'
+$releaseVersion = '0.4.4'
 $buildStamp = Get-Date -Format 'yyyyMMdd-HHmmss'
 $distPath = Join-Path $projectRoot "output/release/builds/$releaseVersion-$buildStamp"
 Set-Location -LiteralPath $projectRoot
