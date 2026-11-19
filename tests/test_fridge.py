@@ -11,8 +11,10 @@ from PySide6.QtWidgets import QApplication, QDialog, QGraphicsItem, QGraphicsRec
 from PySide6.QtCore import QPointF, Qt
 from PySide6.QtTest import QTest
 
+from qubit_sequencer.attachment_ui import payload_from_file
 from qubit_sequencer.fridge_store import FridgeStore
-from qubit_sequencer.fridge_ui import BoardDialog, FridgeWindow, PortDialog, line_type_value, port_color
+from qubit_sequencer.fridge_ui import (AllocationAdjustmentDialog, BoardDialog, FridgeWindow,
+                                     PortDialog, PortStatusDialog, line_type_value, port_color)
 from qubit_sequencer.fridge_templates import TRIANGLE_HEIGHT, snap_to_grid
 from qubit_sequencer.storage import ChipStore
 from qubit_sequencer.undo import EditHistory
@@ -158,6 +160,65 @@ def test_fridge_window_smoke(tmp_path, monkeypatch):
     assert store.port(port_id)["x"] != old_x
     window.undo(); assert store.port(port_id)["x"] == old_x
     window.close(); app.processEvents()
+
+
+def test_port_detail_shows_assignment_and_branch_notes(tmp_path):
+    app = QApplication.instance() or QApplication([])
+    chip = tmp_path / "sample.qchip"; sample(chip)
+    store = FridgeStore.create(tmp_path / "notes.qfridge", "制冷机", with_preset=True)
+    sid = store.add_sample(chip)
+    direct = port(store, "A", "1")["id"]
+    switch = port(store, "F", "O4")["id"]
+    store.assign(direct, sid, notes="普通端口备注")
+    store.assign(switch, sid, notes="分支一备注", branch="1")
+    store.assign(switch, sid, notes="分支二备注", branch="2")
+    window = FridgeWindow(store)
+    window.open_board("A"); window.select_port(direct)
+    assert "备注：普通端口备注" in window.circuit_info.text()
+    window.open_board("F"); window.select_port(switch)
+    text = window.circuit_info.text()
+    assert "分支 1" in text and "备注：分支一备注" in text
+    assert "分支 2" in text and "备注：分支二备注" in text
+    window.close(); app.processEvents()
+
+
+def test_damaged_port_reason_and_evidence_survive_reopen(tmp_path, monkeypatch):
+    app = QApplication.instance() or QApplication([])
+    path = tmp_path / "damage.qfridge"
+    script = tmp_path / "check.py"
+    script.write_bytes(b"# continuity measurement\n")
+    store = FridgeStore.create(path, "制冷机")
+    target = port(store, "A", "1")["id"]
+    store.set_port_status(target, "damaged")
+    window = FridgeWindow(store)
+    window.open_board("A")
+    window.select_port(target)
+
+    def edit(dialog):
+        dialog.reason.setPlainText("中心针损坏\n更换前停用")
+        dialog.panel.add_payload(payload_from_file(str(script)))
+        assert dialog.save_button.isEnabled() and dialog.save()
+        assert not dialog.save_button.isEnabled()
+        return QDialog.DialogCode.Accepted
+
+    monkeypatch.setattr(PortStatusDialog, "exec", edit)
+    assert window.status_note_button.isEnabled()
+    window.status_note_button.click()
+    assert "中心针损坏\n更换前停用" in window.circuit_info.text()
+    assert "（1）" in window.status_note_button.text()
+    window.undo()
+    assert store.port(target)["manual_status"] == "damaged"
+    assert not store.port(target)["status_note"] and not store.parameter_attachments(target)
+    window.redo()
+    window.close(); app.processEvents()
+
+    script.unlink()
+    with closing(FridgeStore.open(path)) as reopened:
+        assert reopened.port(target)["status_note"] == "中心针损坏\n更换前停用"
+        attachment, = reopened.parameter_attachments(target)
+        assert attachment["file_name"] == "check.py"
+        assert reopened.read_attachment(attachment["id"])["data"] == b"# continuity measurement\n"
+        assert not reopened.parameter_attachments(port(reopened, "A", "2")["id"])
 
 
 def test_embedded_overview_and_separate_undo(tmp_path):
@@ -401,3 +462,138 @@ def test_new_plate_and_grid_placement_in_ui(tmp_path, monkeypatch):
     panel.add_port(); panel.undo()
     assert not panel.placing_port
     panel.close(); app.processEvents()
+
+
+def test_plate_rings_distinguish_samples_and_switch_branches(tmp_path):
+    from PySide6.QtWidgets import QGraphicsEllipseItem, QGraphicsPathItem
+    from qubit_sequencer.fridge_ui import FridgeWindow
+    app = QApplication.instance() or QApplication([])
+    a = tmp_path / 'a.qchip'; b = tmp_path / 'b.qchip'
+    sample(a, '一号'); sample(b, '二号')
+    path = tmp_path / 'f.qfridge'; store = FridgeStore.create(path, 'DR', with_preset=True)
+    one = store.add_sample(a); two = store.add_sample(b)
+    first = port(store, 'A', '1')['id']; second = port(store, 'A', '2')['id']; switch = port(store, 'F', 'O4')['id']
+    store.assign(first, one); store.assign(second, two)
+    store.assign(switch, one, branch='1'); store.assign(switch, two, branch='2')
+    window = FridgeWindow(store); window.show(); app.processEvents()
+    def item(ident): return next(i for i in window.scene.items() if hasattr(i, 'port') and i.port['id'] == ident)
+    colors = {key: color.name() for key, color in window.sample_colors.items()}
+    assert colors[one] != colors[two]
+    def strokes(ident):
+        return [i.pen().color().name() for i in item(ident).childItems() if isinstance(i, (QGraphicsEllipseItem, QGraphicsPathItem))]
+    assert colors[one] in strokes(first) and colors[two] in strokes(second)
+    assert colors[one] in strokes(switch) and colors[two] in strokes(switch)
+    assert '一号' in window.legend.text() and '二号' in window.legend.text()
+    assert '分支 1 · 一号' in item(switch).toolTip() and '分支 2 · 二号' in item(switch).toolTip()
+    window.sample.setCurrentIndex(window.sample.findData(one)); app.processEvents()
+    assert window.sample_colors[one].name() == colors[one]
+    window.set_theme('dark'); app.processEvents()
+    assert window.sample_colors[one] != window.sample_colors[two]
+    window.close(); app.processEvents()
+    store = FridgeStore.open(path); window = FridgeWindow(store); window.show(); app.processEvents()
+    assert {key: color.name() for key, color in window.sample_colors.items()} == colors
+    window.close(); app.processEvents()
+
+
+def test_quick_adjustment_moves_overlapping_selection_in_click_order(tmp_path, monkeypatch):
+    app = QApplication.instance() or QApplication([])
+    chip = tmp_path / "sample.qchip"
+    sample(chip)
+    store = FridgeStore.create(tmp_path / "move.qfridge", "DR")
+    sample_id = store.add_sample(chip)
+    ids = {number: port(store, "A", number)["id"] for number in ("13", "14", "15")}
+    store.assign(ids["13"], sample_id, "P13")
+    store.assign(ids["14"], sample_id, "P14")
+    panel = FridgeWindow(store)
+    panel.show()
+    panel.open_board("A")
+    app.processEvents()
+    panel.adjust_button.click()
+
+    def select(*numbers):
+        for index, number in enumerate(numbers):
+            item = next(i for i in panel.scene.items() if hasattr(i, "port") and i.port["id"] == ids[number])
+            assert not item.flags() & QGraphicsItem.GraphicsItemFlag.ItemIsMovable
+            modifier = Qt.KeyboardModifier.ControlModifier if index else Qt.KeyboardModifier.NoModifier
+            QTest.mouseClick(panel.graphics.viewport(), Qt.MouseButton.LeftButton, modifier,
+                             panel.graphics.mapFromScene(item.scenePos()))
+
+    select("14", "13")
+    panel.adjust_next.click()
+    assert [item.label for item in panel.adjust_sources] == ["A14", "A13"]
+    assert not panel.selected_port_ids()
+    select("15")
+    assert not panel.adjust_next.isEnabled()
+    item = next(i for i in panel.scene.items() if hasattr(i, "port") and i.port["id"] == ids["14"])
+    QTest.mouseClick(panel.graphics.viewport(), Qt.MouseButton.LeftButton, Qt.KeyboardModifier.ControlModifier,
+                     panel.graphics.mapFromScene(item.scenePos()))
+
+    def review(dialog):
+        assert [item.label for item in dialog.targets] == ["A15", "A14"]
+        assert dialog.confirm.isEnabled()
+        dialog.accept()
+        return dialog.result()
+
+    monkeypatch.setattr(AllocationAdjustmentDialog, "exec", review)
+    panel.adjust_next.click()
+    assert not panel.adjust_button.isChecked()
+    assert [store.port(ids[n])["pin"] for n in ("13", "14", "15")] == [None, "P13", "P14"]
+    panel.undo()
+    assert [store.port(ids[n])["pin"] for n in ("13", "14", "15")] == ["P13", "P14", None]
+    panel.redo()
+    assert [store.port(ids[n])["pin"] for n in ("13", "14", "15")] == [None, "P13", "P14"]
+    panel.close()
+    app.processEvents()
+
+
+def test_allocation_exchange_preserves_records_and_rechecks_ports(tmp_path):
+    chip = tmp_path / "sample.qchip"
+    sample(chip)
+    with ChipStore.open(chip) as sample_store:
+        sample_store.enable_sample_box()
+        box = sample_store.sample_box_ports()[0]["id"]
+    path = tmp_path / "exchange.qfridge"
+    store = FridgeStore.create(path, "DR", with_preset=True)
+    sid = store.add_sample(chip)
+    switch = port(store, "F", "O4")["id"]
+    read = port(store, "D", "O1")["id"]
+    destination = port(store, "D", "O2")["id"]
+    incompatible = port(store, "A", "1")["id"]
+    circuit = store.circuit(switch)
+    circuit["merge_switches"] = {"OUT": {"inputs": ["1", "2"], "component": {"stage": "MC"}}}
+    store.save_circuit(switch, circuit)
+    store.assign(switch, sid, drawing="D-4", notes="保留备注", branch="OUT", box_port_id=box)
+    store.assign(read, sid, pin="P1")
+    store.assign(destination, sid, pin="P2")
+
+    def endpoint(port_id, branch=None):
+        return next(item for item in store.allocation_endpoints(store.port(port_id)) if item.key[1] == branch)
+
+    sources = (endpoint(switch, "OUT"), endpoint(read))
+    targets = (endpoint(destination), endpoint(switch, "3"))
+    with pytest.raises(ValueError, match="已有分配"):
+        store.adjust_allocations(sources, targets)
+    with pytest.raises(ValueError, match="不兼容"):
+        store.adjust_allocations(sources, (endpoint(incompatible), targets[1]))
+    store.set_branch_occupied(switch, "3", True)
+    with pytest.raises(ValueError, match="已变化"):
+        store.adjust_allocations(sources, targets, exchange=True)
+    store.set_branch_occupied(switch, "3", False)
+    history = EditHistory()
+    history.bind(store.db)
+    store.undo_history = history
+    store.adjust_allocations(sources, targets, exchange=True)
+    assert store.port(destination)["notes"] == "保留备注"
+    assert store.port(destination)["drawing"] == "D-4"
+    assert store.port(destination)["box_port_id"] == box
+    assert not store.port(read)["sample_id"]
+    assert {row["branch"]: row["pin"] for row in store.branch_assignments(switch)} == {"3": "P1", "OUT": "P2"}
+    assert store.circuit(switch) == circuit
+    history.undo()
+    assert store.port(destination)["pin"] == "P2"
+    assert store.branch_assignments(switch)[0]["box_port_id"] == box
+    history.redo()
+    history.detach()
+    store.close()
+    with closing(FridgeStore.open(path)) as store:
+        assert store.box_connections(sid)[0]["id"] == destination and store.circuit(switch) == circuit

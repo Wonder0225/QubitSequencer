@@ -26,3 +26,21 @@
 普通端口 `assignments` 和开关分支 `branch_assignments` 增加可空的 `box_port_id`。有值时以 `sample_id` 和该接口 ID 从关联样品读取当前编号、元件和信号名称。一个样品接口在同一制冷机项目中只能分配给一个端口或分支。
 
 打开 v1 或 v2 的制冷机项目会先生成 `.pre-vN.qfridge` 备份。原分配的 `box_port_id` 留空，继续使用直接关联方式。用户改接样品盒接口时，原引脚、关联器件和迁移资料保留。样品或接口不可用时保留分配，界面和导出显示状态。
+
+## `.qfridge` v4
+
+`component_library` 保存项目元件库条目。选用库条目时将默认参数复制到线路实例。`port_circuits` 继续以端口为键，`components` 是端口共用链，`switch` 是有序分支编号，`switch_component` 可记录开关的温级及参数，`branch_components` 按分支编号保存元件列表。样品分配仍保存在原分配表中。
+
+打开 v3 文件先备份再添加元件库表。原线路无需重写，缺少分支元件列表时视为空，缺少开关温级时显示温级未登记。
+
+## `.qfridge` v5
+
+线路 JSON 中的 `switch` 和 `switch_component` 继续保存第一级开关。可选字段 `branch_switches` 以完整分支路径为键，保存该段末端开关的 `component` 参数和有序 `branches` 编号。`branch_components` 可为任一级的线路段登记元件。样品分配和占用使用末端支路的完整路径，例如 `1/2`。打开 v4 文件先备份，现有的一级开关和分支编号继续有效。
+
+## `.qfridge` v6
+
+可选字段 `merge_switches` 以公共输出编号为键，记录合路开关的 `component` 和接入的末端 `inputs`。合路输入继续使用原路径登记元件，公共输出的元件也保存在 `branch_components`，样品分配与占用登记使用公共输出编号。打开 v5 文件时先备份，原线路保留原布局和分配。
+
+## `.qfridge` v7
+
+端口状态原因保存在 `meta` 的 `status_note:<port_id>` 键下。附件沿用标定附件的三个表，`record_attachments.record_id` 指向物理端口，文件快照和历史版本保存在项目内。旧项目打开时先备份再新增附件表，原端口的原因和附件默认留空。

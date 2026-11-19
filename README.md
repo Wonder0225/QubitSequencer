@@ -1,6 +1,6 @@
 # Qubit Sequencer 芯片登记
 
-用于登记超导量子芯片的逻辑构型、比特/耦合器参数、耦合关系和制冷机接线的本机桌面程序。芯片项目保存为单个 `.qchip` 文件。当前源码版本为 **0.4.4**。
+用于登记超导量子芯片的逻辑构型、比特/耦合器参数、耦合关系和制冷机接线的本机桌面程序。芯片项目保存为单个 `.qchip` 文件。当前源码版本为 **0.4.5**。
 
 ![科研工作台](docs/images/dark-mode.png)
 
@@ -46,7 +46,7 @@ python -m qubit_sequencer sample my_chip.qchip --template surface --mode coupler
 python -m qubit_sequencer validate my_chip.qchip
 ```
 
-当前源码使用 `.qchip` v10 和 `.qfridge` v3。旧项目打开时先自动备份再升级，也可执行 `python -m qubit_sequencer migrate my_chip.qchip` 升级芯片文件。切回旧版时使用迁移前备份。
+当前源码使用 `.qchip` v10 和 `.qfridge` v7。旧项目打开时先自动备份再升级，也可执行 `python -m qubit_sequencer migrate my_chip.qchip` 升级芯片文件。切回旧版时使用迁移前备份。
 
 ## 文档与示例
 

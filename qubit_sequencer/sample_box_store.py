@@ -1,6 +1,7 @@
 """Sample-box geometry and chip-side port bindings."""
 
 import json
+import re
 from uuid import uuid4
 
 from .sample_box_templates import DEFAULT_TEMPLATE, builtin_sample_box_template
@@ -40,6 +41,11 @@ def box_connection_label(connection):
     if connection["branch"] is not None:
         label += f" / {connection['branch']}"
     return label
+
+
+def port_number_key(value):
+    return tuple((1, int(part)) if part.isdecimal() else (0, part.casefold())
+                 for part in re.split(r"(\d+)", str(value)) if part)
 
 
 class SampleBoxStore:

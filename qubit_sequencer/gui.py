@@ -548,7 +548,7 @@ class DevicePopup(QDialog):
         self.device_id: str | None = None
         self.definitions = []
         self.setWindowTitle("编辑芯片元件")
-        self.resize(390, 560)
+        self.resize(390, 720)
         layout = QVBoxLayout(self)
         layout.setContentsMargins(16, 16, 16, 16)
         layout.setSpacing(8)
@@ -571,7 +571,7 @@ class DevicePopup(QDialog):
         self.parameters = QTableWidget(0, 2)
         delegate = TexTableDelegate(self.parameters); delegate.label_columns = {0}
         self.parameters.setItemDelegate(delegate)
-        self.parameters.setMinimumHeight(130)
+        self.parameters.setMinimumHeight(200)
         self.parameters.setAlternatingRowColors(True)
         self.parameters.cellDoubleClicked.connect(self.edit_parameter)
         layout.addWidget(self.parameters, 1)
@@ -595,7 +595,7 @@ class DevicePopup(QDialog):
         screen = QGuiApplication.screenAt(anchor) or QGuiApplication.primaryScreen()
         if screen:
             area = screen.availableGeometry()
-            self.resize(min(390, area.width()-24), min(560, area.height()-24))
+            self.resize(min(390, area.width()-24), min(720, area.height()-24))
             x = max(area.left(), min(anchor.x()+12, area.right()-self.width()))
             y = max(area.top(), min(anchor.y()+12, area.bottom()-self.height()))
             self.move(x, y)
@@ -617,7 +617,8 @@ class DevicePopup(QDialog):
                            f"{DEVICE_NAMES[device['kind']]}</span>")
         self.editor.bind("device", self.device_id)
         self.readout_info.setText("\n".join(filter(None, (self.host.store.readout_summary(self.device_id),
-                                                        self.host.store.sample_box_summary(self.device_id)))))
+                                                        self.host.store.sample_box_summary(self.device_id),
+                                                        self.host.device_wiring_summary(self.device_id)))))
         self.readout_info.setVisible(bool(self.readout_info.text()))
         point = self.host.point_combo.currentText() or "default"
         records = self.host.store.current_records(point)
@@ -1071,6 +1072,9 @@ class MainWindow(QMainWindow, WorkbenchLayout):
             self.sample_box_panel.refresh_connections()
         if self.store and self.scene and (self.field_combo.currentData() or '').startswith('wiring.'):
             self.refresh_scene()
+        if self.store and self.selected:
+            self.refresh_detail()
+            if hasattr(self, 'device_popup') and self.device_popup.isVisible(): self.device_popup.reload()
         self._update_undo_action()
 
     def _active_fridge_panel(self):
@@ -1455,6 +1459,10 @@ class MainWindow(QMainWindow, WorkbenchLayout):
                 self.store.delete_device(mediator)
             self._error("连接失败", exc)
 
+    def device_wiring_summary(self, ident):
+        from .quick_wiring import device_wiring_summary
+        return device_wiring_summary(self.store, self.fridge_panel, ident) if self.store else ''
+
     def refresh_detail(self):
         headers = ["参数", "当前值", "单位"]
         default_widths = {"参数": 128, "当前值": 80, "单位": 52}
@@ -1478,7 +1486,8 @@ class MainWindow(QMainWindow, WorkbenchLayout):
                 self.selected_title.setText(f"<b>{tex_to_html(obj['label'])}</b> · {DEVICE_NAMES[scope]}")
                 name = obj["label"]
                 self.readout_info.setText("\n".join(filter(None, (self.store.readout_summary(ident),
-                                                                self.store.sample_box_summary(ident)))))
+                                                                self.store.sample_box_summary(ident),
+                                                                self.device_wiring_summary(ident)))))
             elif kind == "readout_link":
                 obj = self.store.readout_link(ident); scope = "readout_link"
                 a = self.store.device(obj["readout_id"])["label"]

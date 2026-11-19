@@ -1,5 +1,6 @@
 import pytest
-from PySide6.QtWidgets import QApplication, QDialog
+from PySide6.QtCore import Qt
+from PySide6.QtWidgets import QApplication, QDialog, QMessageBox
 from qubit_sequencer.storage import ChipStore
 from qubit_sequencer.fridge_store import FridgeStore
 from qubit_sequencer.quick_wiring import QuickWiringDialog, diagram_values
@@ -51,7 +52,7 @@ def test_quick_wiring_conflict_rolls_back(tmp_path):
         fridge.close()
 
 
-def test_readout_matching_partial_and_switch_exclusion(tmp_path):
+def test_readout_matching_partial_and_switch_type_mismatch(tmp_path):
     app = QApplication.instance() or QApplication([])
     path = tmp_path / 'readout.qchip'
     with ChipStore.create(path, 'chip') as chip:
@@ -66,10 +67,65 @@ def test_readout_matching_partial_and_switch_exclusion(tmp_path):
         assert dialog.table.cellWidget(row, 3).currentData() == next(p['id'] for p in targets if p['board'] == 'A')
         assert any('缺少读出' in dialog.table.item(i, 4).text() for i in range(dialog.table.rowCount()))
         combo = dialog.table.cellWidget(row, 3)
-        for i, p in enumerate(targets):
-            if p['board'] in ('D', 'F'):
-                assert not combo.model().item(combo.findData(p['id'])).isEnabled()
+        switch = next(p['id'] for p in targets if p['board'] == 'F')
+        for index in range(1, combo.count()):
+            endpoint = combo.itemData(index)
+            if isinstance(endpoint, tuple):
+                assert endpoint[0] == switch and not combo.model().item(index).isEnabled()
+            elif endpoint == next(p['id'] for p in targets if p['board'] == 'D'):
+                assert not combo.model().item(index).isEnabled()
         dialog.accept(); assert len(fridge.box_connections(sid)) == 1
+        fridge.close()
+    app.processEvents()
+
+
+def test_quick_wiring_manual_switch_endpoints_and_atomic_recheck(tmp_path, monkeypatch):
+    app = QApplication.instance() or QApplication([])
+    path = tmp_path / 'switch.qchip'
+    with ChipStore.create(path, 'chip') as chip:
+        first = chip.add_device('qubit', 'fixed_transmon', 'Q1', 0, 0)
+        second = chip.add_device('qubit', 'fixed_transmon', 'Q2', 1, 0)
+        chip.enable_sample_box()
+        for device, box in zip((first, second), chip.sample_box_ports()):
+            chip.save_sample_box_port(box['id'], box['number'], True, device)
+        fridge = FridgeStore.create(tmp_path / 'f.qfridge', 'DR', with_preset=True)
+        sid = fridge.add_sample(path)
+        port_id = next(p['id'] for p in fridge.ports() if (p['board'], p['number']) == ('F', 'O4'))
+        circuit = fridge.circuit(port_id)
+        circuit['merge_switches'] = {'OUT': {'inputs': ['1', '2'], 'component': {'stage': 'MC'}}}
+        fridge.save_circuit(port_id, circuit)
+        fridge.assign(port_id, sid, 'original', branch='3')
+        fridge.set_branch_occupied(port_id, '4', True)
+        history = EditHistory()
+        history.bind(fridge.db)
+        fridge.undo_history = history
+        dialog = QuickWiringDialog(None, chip, fridge, fridge.sample(sid), [first, second], [port_id])
+        combos = [dialog.table.cellWidget(i, 3) for i in range(2)]
+        assert all(not combo.currentData() for combo in combos)
+        indices = {combos[0].itemData(i)[1]: i for i in range(1, combos[0].count())}
+        assert set(indices) == {'3', '4', '5', '6', 'OUT'}
+        assert not combos[0].model().item(indices['3']).isEnabled()
+        assert not combos[0].model().item(indices['4']).isEnabled()
+        assert '公共输出 OUT' in combos[0].itemText(indices['OUT'])
+        combos[0].setCurrentIndex(indices['5'])
+        combos[1].setCurrentIndex(indices['5'])
+        assert dialog.table.item(0, 4).text() == '目标端口重复'
+        combos[1].setCurrentIndex(indices['OUT'])
+        assert all(dialog.table.item(i, 0).checkState() == Qt.CheckState.Checked for i in range(2))
+        warnings = []
+        monkeypatch.setattr(QMessageBox, 'warning', lambda *args: warnings.append(args[2]))
+        fridge.set_branch_occupied(port_id, 'OUT', True)
+        dialog.accept()
+        assert '已占用' in warnings[-1] and not fridge.box_connections(sid)
+        fridge.set_branch_occupied(port_id, 'OUT', False)
+        dialog.accept()
+        assert dialog.result() == QDialog.DialogCode.Accepted
+        assert {row['branch'] for row in fridge.box_connections(sid)} == {'5', 'OUT'}
+        history.undo()
+        assert not fridge.box_connections(sid) and fridge.branch_assignments(port_id)[0]['branch'] == '3'
+        history.redo()
+        assert {row['branch'] for row in fridge.box_connections(sid)} == {'5', 'OUT'}
+        history.detach()
         fridge.close()
     app.processEvents()
 
@@ -180,7 +236,7 @@ def test_quick_wiring_uses_click_order_without_reordering(tmp_path):
     window.close(); app.processEvents()
 
 
-def test_incompatible_selected_pair_does_not_shift(tmp_path):
+def test_incompatible_port_remains_available_for_later_interface(tmp_path):
     app = QApplication.instance() or QApplication([])
     path = tmp_path / 'read.qchip'
     with ChipStore.create(path, 'chip') as chip:
@@ -193,9 +249,32 @@ def test_incompatible_selected_pair_does_not_shift(tmp_path):
         output = next(p for p in fridge.ports() if p['board'] == 'D' and p['number'] == 'O1')
         xy = next(p for p in fridge.ports() if p['board'] == 'A' and p['number'] == '13')
         dialog = QuickWiringDialog(None, chip, fridge, fridge.sample(sid), [bus, q], [output['id'], xy['id']])
-        assert dialog.table.cellWidget(0, 3).currentData() == output['id']
-        assert dialog.table.item(0, 4).text() == '接口类型不匹配'
+        assert not dialog.table.cellWidget(0, 3).currentData()
         qrow = next(i for i, row in enumerate(dialog.rows) if row[0] == 'Q')
-        assert dialog.table.cellWidget(qrow, 3).currentData() == xy['id']
+        assert dialog.table.cellWidget(qrow, 3).currentData() == output['id']
+        fridge.close()
+    app.processEvents()
+
+
+def test_already_connected_readin_does_not_claim_readout_port(tmp_path):
+    from PySide6.QtCore import Qt
+    app = QApplication.instance() or QApplication([])
+    path = tmp_path / 'read.qchip'
+    with ChipStore.create(path, 'chip') as chip:
+        bus = chip.add_device('readout', 'readout_line', 'R', 0, 0)
+        chip.enable_sample_box(); boxes = chip.sample_box_ports()
+        chip.save_sample_box_port(boxes[0]['id'], boxes[0]['number'], True, bus, 'read_in')
+        chip.save_sample_box_port(boxes[1]['id'], boxes[1]['number'], True, bus, 'read_out')
+        fridge = FridgeStore.create(tmp_path / 'f.qfridge', 'DR'); sid = fridge.add_sample(path)
+        source = next(p for p in fridge.ports() if p['board'] == 'A' and p['number'] == '1')
+        target = next(p for p in fridge.ports() if p['board'] == 'E' and p['number'] == 'O3')
+        fridge.assign(source['id'], sid, box_port_id=boxes[0]['id'])
+        dialog = QuickWiringDialog(None, chip, fridge, fridge.sample(sid), [bus], [target['id']])
+        assert dialog.table.item(0, 4).text() == '样品盒接口已有连接'
+        assert not dialog.table.cellWidget(0, 3).currentData()
+        assert dialog.table.cellWidget(1, 3).currentData() == target['id']
+        assert dialog.table.item(1, 0).checkState() == Qt.CheckState.Checked
+        dialog.accept(); assert dialog.result() == QDialog.DialogCode.Accepted
+        assert {row['id'] for row in fridge.box_connections(sid)} == {source['id'], target['id']}
         fridge.close()
     app.processEvents()

@@ -8,12 +8,12 @@ from pathlib import Path
 from .undo import undoable
 
 
-ATTACHMENT_STATEMENTS = (
+_ATTACHMENT_STATEMENTS = (
     """CREATE TABLE attachment_blobs (
         sha256 TEXT PRIMARY KEY, byte_size INTEGER NOT NULL CHECK(byte_size>=0),
         data BLOB NOT NULL)""",
     """CREATE TABLE record_attachments (
-        id TEXT PRIMARY KEY, record_id TEXT NOT NULL REFERENCES parameter_records(id) ON DELETE CASCADE,
+        id TEXT PRIMARY KEY, record_id TEXT NOT NULL REFERENCES {owner_table}(id) ON DELETE CASCADE,
         created_at TEXT NOT NULL, modified_at TEXT NOT NULL,
         removed INTEGER NOT NULL DEFAULT 0 CHECK(removed IN (0,1)))""",
     "CREATE INDEX record_attachments_record ON record_attachments(record_id)",
@@ -29,6 +29,13 @@ ATTACHMENT_STATEMENTS = (
           AND NOT EXISTS (SELECT 1 FROM attachment_versions WHERE sha256=OLD.sha256);
         END""",
 )
+
+
+def attachment_statements(owner_table):
+    return tuple(statement.format(owner_table=owner_table) for statement in _ATTACHMENT_STATEMENTS)
+
+
+ATTACHMENT_STATEMENTS = attachment_statements("parameter_records")
 ATTACHMENT_SCHEMA = ";\n".join(ATTACHMENT_STATEMENTS) + ";\n"
 
 
@@ -65,7 +72,7 @@ def safe_file_name(name: str) -> str:
 
 
 class AttachmentStore:
-    """Mixed into ChipStore; all writes share its SQLite connection/transaction."""
+    """Versioned attachments sharing the owning project's SQLite connection."""
 
     def record(self, record_id: str):
         row = self.db.execute("SELECT * FROM parameter_records WHERE id=?", (record_id,)).fetchone()
@@ -167,7 +174,7 @@ class AttachmentStore:
                     "SELECT * FROM record_attachments WHERE id=? AND record_id=?", (ident, record_id)
                 ).fetchone()
                 if existing is None:
-                    raise ValueError("附件不属于这条参数记录")
+                    raise ValueError("附件不属于当前记录")
                 latest = self.db.execute(
                     "SELECT MAX(version) FROM attachment_versions WHERE attachment_id=?", (ident,)
                 ).fetchone()[0]
@@ -202,7 +209,7 @@ class AttachmentStore:
         row = self.read_attachment(attachment_id, version)
         path = Path(destination)
         if path.resolve() == self.path.resolve():
-            raise ValueError("不能覆盖当前芯片文件")
+            raise ValueError("不能覆盖当前项目文件")
         with path.open("xb") as stream:
             stream.write(row["data"])
         return path

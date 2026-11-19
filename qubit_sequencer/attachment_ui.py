@@ -109,7 +109,7 @@ def install_paste_shortcut(host, panel):
 def export_payload(payload, destination, protected_path=None):
     target = Path(destination)
     if protected_path and target.resolve() == Path(protected_path).resolve():
-        raise ValueError("不能覆盖当前芯片文件")
+        raise ValueError("不能覆盖当前项目文件")
     file = QSaveFile(str(target))
     if not file.open(QIODevice.OpenModeFlag.WriteOnly):
         raise OSError(file.errorString())
@@ -551,7 +551,7 @@ class AttachmentPanel(QWidget):
             self.status.setText(str(exc))
 
     def choose_files(self):
-        paths, _ = QFileDialog.getOpenFileNames(self, "添加标定附件", "", "所有文件 (*)")
+        paths, _ = QFileDialog.getOpenFileNames(self, "添加附件", "", "所有文件 (*)")
         self.import_files(paths)
 
     def replace_file(self):
@@ -711,35 +711,17 @@ class AttachmentPanel(QWidget):
                 thread.wait()
 
 
-class AttachmentDialog(QDialog):
+class AttachmentEditorDialog(QDialog):
     saved = Signal()
 
-    def __init__(self, store, record_id, parent=None):
+    def __init__(self, store, record_id, title, header_widgets, parent=None):
         super().__init__(parent)
-        self._is_attachment_dialog = True
         self.store, self.record_id = store, record_id
-        self.setWindowTitle("参数记录与标定附件")
+        self.setWindowTitle(title)
         self.resize(980, 670); self.setMinimumSize(700, 450)
         layout = QVBoxLayout(self)
-        record = store.record(record_id)
-        definition = store.definition(record["definition_key"])
-        if record["device_id"]:
-            name = store.device(record["device_id"])["label"]
-        elif record["coupling_id"]:
-            coupling = store.coupling(record["coupling_id"])
-            name = f"{store.device(coupling['qubit_a'])['label']} ↔ {store.device(coupling['qubit_b'])['label']}"
-        else:
-            link = store.link(record["link_id"])
-            name = f"{store.device(link['qubit_id'])['label']} — {store.device(link['coupler_id'])['label']}"
-        value = record["numeric_value"] if record["numeric_value"] is not None else record["text_value"]
-        label = QLabel(f"<b>{tex_to_html(name)} · {tex_to_html(definition['label'])}</b><br>"
-                       f"{html.escape(str(value) if value is not None else '未填写')} {html.escape(definition['unit'])}"
-                       f" · 工作点 {html.escape(record['point'])}"
-                       f" · {html.escape(display_timestamp(record['observed_at']))}")
-        label.setWordWrap(True); layout.addWidget(label)
-        details = QLabel(f"来源：{record['source'] or '未填写'} · 备注：{record['notes'] or '未填写'}")
-        details.setTextFormat(Qt.TextFormat.PlainText); details.setWordWrap(True)
-        details.setProperty("role", "muted"); layout.addWidget(details)
+        for widget in header_widgets:
+            layout.addWidget(widget)
         self.panel = AttachmentPanel(store, record_id, self)
         layout.addWidget(self.panel, 1)
         self.error = QLabel(); self.error.setProperty("role", "danger"); self.error.setWordWrap(True)
@@ -760,36 +742,46 @@ class AttachmentDialog(QDialog):
         self.update_state()
 
     def update_state(self, *_):
-        dirty = self.panel.is_dirty()
+        dirty = self.is_dirty()
         self.save_button.setEnabled(dirty and not self.panel.busy)
         self.cancel_button.setEnabled(dirty and not self.panel.busy)
         self.close_button.setEnabled(not self.panel.busy)
 
+    def is_dirty(self):
+        return self.panel.is_dirty()
+
+    def commit_changes(self, changes):
+        return self.store.commit_attachment_changes(self.record_id, changes)
+
     def save(self):
         try:
             changes = self.panel.changes()
-            if changes:
+            if self.is_dirty():
                 changed_drafts = [draft for draft in self.panel.drafts if draft.dirty()]
-                ids = self.store.commit_attachment_changes(self.record_id, changes)
+                ids = self.commit_changes(changes)
                 for draft, ident in zip(changed_drafts, ids):
                     draft.id = ident
                 self.panel.reload(); self.saved.emit()
-            self.error.clear(); self.panel.status.setText("附件更改已写入芯片文件。")
+            self.error.clear(); self.panel.status.setText("更改已保存。")
             return True
         except Exception as exc:
             self.error.setText(f"保存失败：{exc}。输入已保留。")
             return False
 
     def reset_changes(self):
-        with self.panel.undo_history.action("取消附件更改"):
+        with self.panel.undo_history.action("取消更改"):
+            self.reset_header()
             self.panel.reload(clear_history=False); self.error.clear()
+
+    def reset_header(self):
+        pass
 
     def reject(self):
         if self.panel.busy:
             self.error.setText("附件正在读取，请完成后再关闭。"); return
-        if self.panel.is_dirty():
+        if self.is_dirty():
             dialog = QMessageBox(self)
-            dialog.setWindowTitle("未保存的附件更改"); dialog.setText("关闭前如何处理附件更改？")
+            dialog.setWindowTitle("未保存的更改"); dialog.setText("关闭前如何处理更改？")
             save = dialog.addButton("保存更改", QMessageBox.ButtonRole.AcceptRole)
             discard = dialog.addButton("放弃更改", QMessageBox.ButtonRole.DestructiveRole)
             dialog.addButton("取消", QMessageBox.ButtonRole.RejectRole)
@@ -800,3 +792,28 @@ class AttachmentDialog(QDialog):
             elif dialog.clickedButton() is not discard:
                 return
         super().reject()
+
+
+class AttachmentDialog(AttachmentEditorDialog):
+    def __init__(self, store, record_id, parent=None):
+        record = store.record(record_id)
+        definition = store.definition(record["definition_key"])
+        if record["device_id"]:
+            name = store.device(record["device_id"])["label"]
+        elif record["coupling_id"]:
+            coupling = store.coupling(record["coupling_id"])
+            name = f"{store.device(coupling['qubit_a'])['label']} ↔ {store.device(coupling['qubit_b'])['label']}"
+        else:
+            link = store.link(record["link_id"])
+            name = f"{store.device(link['qubit_id'])['label']} — {store.device(link['coupler_id'])['label']}"
+        value = record["numeric_value"] if record["numeric_value"] is not None else record["text_value"]
+        label = QLabel(f"<b>{tex_to_html(name)} · {tex_to_html(definition['label'])}</b><br>"
+                       f"{html.escape(str(value) if value is not None else '未填写')} {html.escape(definition['unit'])}"
+                       f" · 工作点 {html.escape(record['point'])}"
+                       f" · {html.escape(display_timestamp(record['observed_at']))}")
+        label.setWordWrap(True)
+        details = QLabel(f"来源：{record['source'] or '未填写'} · 备注：{record['notes'] or '未填写'}")
+        details.setTextFormat(Qt.TextFormat.PlainText); details.setWordWrap(True)
+        details.setProperty("role", "muted")
+        super().__init__(store, record_id, "参数记录与标定附件", (label, details), parent)
+        self._is_attachment_dialog = True

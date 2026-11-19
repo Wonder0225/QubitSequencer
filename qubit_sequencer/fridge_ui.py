@@ -4,20 +4,24 @@ from __future__ import annotations
 
 import json
 import math
+import sqlite3
+from html import escape
 from collections import Counter
 from pathlib import Path
 
 from PySide6.QtCore import QFileSystemWatcher, QPointF, Qt, QTimer
-from PySide6.QtGui import QAction, QBrush, QColor, QPainter, QPen
+from PySide6.QtGui import QAction, QBrush, QColor, QPainter, QPainterPath, QPen
 from PySide6.QtWidgets import (QAbstractItemView, QApplication, QCheckBox, QComboBox, QDialog, QDialogButtonBox,
     QDoubleSpinBox, QFileDialog, QFormLayout, QGraphicsEllipseItem, QGraphicsItem,
     QGraphicsScene, QGraphicsSimpleTextItem, QGraphicsView, QHBoxLayout, QHeaderView, QInputDialog,
     QLabel, QLineEdit, QListWidget, QListWidgetItem, QMenu, QMessageBox, QPlainTextEdit, QPushButton,
     QScrollArea, QSizePolicy, QSplitter, QTabWidget, QTableWidget, QTableWidgetItem, QVBoxLayout, QWidget)
 
-from .fridge_store import display_line_type, stored_line_type
+from .attachment_ui import AttachmentEditorDialog
+from .fridge_store import ASSIGNMENT_FIELDS, allocation_updates, display_line_type, stored_line_type
 from .fridge_templates import GRID_NAMES, TEMPLATE_NAMES, grid_height, snap_to_grid
-from .fridge_circuit_ui import CircuitDialog, PresetDialog, component_text
+from .fridge_circuit_ui import CircuitDialog, ComponentLibraryDialog, PresetDialog
+from .fridge_components import component_text, terminal_branches
 from .device_types import DEVICE_NAMES
 from .sample_box_store import BOX_ROLES, box_number_source
 from .undo import EditHistory
@@ -27,11 +31,114 @@ from .ui_icons import icon
 from .graphics_interaction import RightPanMixin
 
 
+class PortStatusDialog(AttachmentEditorDialog):
+    def __init__(self, parent, store, port):
+        self.saved_note = port["status_note"]
+        self.reason = QPlainTextEdit(self.saved_note)
+        self.reason.setPlaceholderText("填写占用或损坏的原因")
+        self.reason.setMaximumHeight(94)
+        label = QLabel("原因备注")
+        label.setBuddy(self.reason)
+        title = f"{port['board']} 盘 {port['number']} · 占用／损坏原因及附件"
+        super().__init__(store, port["id"], title, (label, self.reason), parent)
+        self.reason.textChanged.connect(self.update_state)
+
+    def is_dirty(self):
+        return self.reason.toPlainText().strip() != self.saved_note or super().is_dirty()
+
+    def commit_changes(self, changes):
+        note = self.reason.toPlainText().strip()
+        ids = self.store.save_port_status_note(self.record_id, note, changes)
+        self.saved_note = note
+        return ids
+
+    def reset_header(self):
+        self.reason.setPlainText(self.saved_note)
+
+
+class AllocationAdjustmentDialog(QDialog):
+    def __init__(self, parent, store, sources, targets):
+        super().__init__(parent)
+        self.store, self.sources, self.targets = store, sources, targets
+        self.setWindowTitle("快速调整接线分配")
+        self.resize(850, 480)
+        layout = QVBoxLayout(self)
+        self.exchange = QCheckBox("交换两组分配")
+        self.exchange.setToolTip("把目标上的现有分配移回对应的来源端，空闲目标等同迁移。")
+        layout.addWidget(self.exchange)
+        table = QTableWidget(len(sources), 4)
+        table.setHorizontalHeaderLabels(("来源接线端", "来源分配", "目标接线端", "目标现有分配"))
+        table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        table.horizontalHeader().setStretchLastSection(True)
+        cache = {}
+        for row, (source, target) in enumerate(zip(sources, targets)):
+            for col, text in enumerate((source.label, self.describe(source, cache),
+                                        target.label, self.describe(target, cache))):
+                table.setItem(row, col, QTableWidgetItem(text))
+        table.resizeColumnsToContents()
+        layout.addWidget(table)
+        self.status = QLabel()
+        self.status.setWordWrap(True)
+        layout.addWidget(self.status)
+        controls = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
+        self.confirm = controls.button(QDialogButtonBox.StandardButton.Ok)
+        controls.button(QDialogButtonBox.StandardButton.Cancel).setText("取消")
+        controls.accepted.connect(self.accept)
+        controls.rejected.connect(self.reject)
+        layout.addWidget(controls)
+        self.exchange.toggled.connect(self.refresh_preview)
+        self.refresh_preview()
+
+    def describe(self, endpoint, cache):
+        if endpoint.record is None:
+            return "未分配"
+        record = dict(zip(ASSIGNMENT_FIELDS, endpoint.record))
+        details = [endpoint.sample, display_line_type(record["usage"])]
+        if record["box_port_id"]:
+            box, status, devices = self.store.resolve_assignment(record, cache)
+            details.append(f"样品盒接口 {box['number']}" if box else status)
+        else:
+            devices = json.loads(record["devices_json"])
+            if record["pin"]:
+                details.append(f"引脚 {record['pin']}")
+        details.extend(d["label"] for d in devices)
+        return " · ".join(filter(None, details))
+
+    def refresh_preview(self):
+        exchange = self.exchange.isChecked()
+        self.confirm.setText("确认交换" if exchange else "确认迁移")
+        try:
+            allocation_updates(self.sources, self.targets, exchange)
+        except ValueError as exc:
+            self.status.setText(str(exc))
+            self.confirm.setEnabled(False)
+        else:
+            self.status.setText(f"共 {len(self.sources)} 对。样品接线分配随记录移动，低温线路与端口状态按原位置保留。")
+            self.confirm.setEnabled(True)
+
+    def accept(self):
+        if not self.confirm.isEnabled():
+            return
+        try:
+            self.store.adjust_allocations(self.sources, self.targets, self.exchange.isChecked())
+        except (ValueError, sqlite3.Error) as exc:
+            self.status.setText(str(exc))
+            self.confirm.setEnabled(False)
+            return
+        super().accept()
+
+
 def port_color(kind, theme):
     colors = DIAGRAM_COLORS[theme]
     key = {"XY": "x_check", "Z": "x_check", "XY/Z": "x_check",
            "直流": "muted", "读取输入": "data", "读取输出": "coupler", "读入": "data", "读出": "coupler"}.get(kind, "missing")
     return QColor(colors[key])
+
+
+def sample_ring_color(index, theme):
+    """Use the stable sample rowid to keep colors across filtering and reopening."""
+    hue = ((index - 1) * 0.61803398875 + 0.93) % 1.0
+    return QColor.fromHsvF(hue, 0.78 if theme == "light" else 0.72, 0.72 if theme == "light" else 1.0)
 
 
 class PortView(RightPanMixin, QGraphicsView):
@@ -299,12 +406,25 @@ class PortItem(QGraphicsEllipseItem):
         color = port_color(port["kind"], window.theme)
         self.setBrush(QBrush(color))
         self.setPen(QPen(QColor(DIAGRAM_COLORS[window.theme]["ink"]), 1.2))
-        if port["sample_id"] or window.store.branch_marks(port["id"]):
-            for width, shade in ((5, DIAGRAM_COLORS[window.theme]["paper"]),
-                                 (3, "#00B8D9" if window.theme == "light" else "#52E6FF")):
+        assignments = window.store.branch_assignments(port["id"])
+        sample_ids = list(dict.fromkeys([port["direct_sample_id"]] if port["direct_sample_id"] else
+                                        [row["sample_id"] for row in assignments]))
+        unknown = bool(window.store.branch_marks(port["id"]) - {row["branch"] for row in assignments})
+        shades = [window.sample_colors[ident] for ident in sample_ids]
+        if unknown: shades.append(QColor(DIAGRAM_COLORS[window.theme]["muted"]))
+        if shades:
+            ring = QGraphicsEllipseItem(-25, -25, 50, 50, self)
+            ring.setPen(QPen(QColor(DIAGRAM_COLORS[window.theme]["paper"]), 5)); ring.setBrush(QBrush(Qt.BrushStyle.NoBrush))
+            ring.setAcceptedMouseButtons(Qt.MouseButton.NoButton)
+            if len(shades) == 1:
                 ring = QGraphicsEllipseItem(-25, -25, 50, 50, self)
-                ring.setPen(QPen(QColor(shade), width)); ring.setBrush(QBrush(Qt.BrushStyle.NoBrush))
+                ring.setPen(QPen(shades[0], 3)); ring.setBrush(QBrush(Qt.BrushStyle.NoBrush))
                 ring.setAcceptedMouseButtons(Qt.MouseButton.NoButton)
+            else:
+                for index, shade in enumerate(shades):
+                    path = QPainterPath(); path.arcMoveTo(-25, -25, 50, 50, 90 - index * 360 / len(shades))
+                    path.arcTo(-25, -25, 50, 50, 90 - index * 360 / len(shades), -360 / len(shades) + 4)
+                    arc = self.scene_arc(path, shade); arc.setParentItem(self)
         if port["manually_occupied"]:
             badge = QGraphicsEllipseItem(11, -25, 19, 19, self)
             badge.setPen(QPen(QColor("#FFFFFF"), 1)); badge.setBrush(QBrush(QColor("#B91C1C" if port["manual_status"] == "damaged" else "#C2410C")))
@@ -313,14 +433,17 @@ class PortItem(QGraphicsEllipseItem):
             font = mark.font(); font.setPixelSize(12); mark.setFont(font)
             bounds = mark.boundingRect(); mark.setPos(20.5 - bounds.width() / 2, -15.5 - bounds.height() / 2)
         self.setToolTip(f"{port['board']} · {port['number']}\n{display_line_type(port['kind'])}\n{port['sample_name'] or '未分配'}" + ("\n已损坏" if port["manual_status"] == "damaged" else "\n已占用（手动标记）" if port["manually_occupied"] else ""))
-        self.setFlag(QGraphicsItem.GraphicsItemFlag.ItemIsMovable, not window.preview and not window.is_overview())
+        if assignments:
+            self.setToolTip(self.toolTip() + "\n" + "\n".join(f"分支 {r['branch']} · {r['sample_name']}" for r in assignments))
+        self.setFlag(QGraphicsItem.GraphicsItemFlag.ItemIsMovable,
+                     not (window.preview or window.is_overview() or window.adjust_button.isChecked()))
         self.setFlag(QGraphicsItem.GraphicsItemFlag.ItemIsSelectable, True)
         self.setFlag(QGraphicsItem.GraphicsItemFlag.ItemSendsGeometryChanges, True)
         brightness = (color.red() * 299 + color.green() * 587 + color.blue() * 114) / 1000
         label = QGraphicsSimpleTextItem(port["number"], self)
         label.setBrush(QBrush(QColor("#20252E" if brightness > 150 else "#FFFFFF")))
         font = label.font(); font.setPixelSize(20); label.setFont(font)
-        branches = window.store.circuit(port["id"]).get("switch", [])
+        branches = terminal_branches(window.store.circuit(port["id"]))
         rect = label.boundingRect(); label.setPos(-rect.width() / 2, -rect.height() / 2 - (6 if branches else 0))
         if branches:
             assigned = {row["branch"] for row in window.store.branch_assignments(port["id"])}
@@ -329,6 +452,13 @@ class PortItem(QGraphicsEllipseItem):
             ratio.setBrush(label.brush()); font = ratio.font(); font.setPixelSize(10); font.setBold(True); ratio.setFont(font)
             rect = ratio.boundingRect(); ratio.setPos(-rect.width() / 2, 7); ratio.setAcceptedMouseButtons(Qt.MouseButton.NoButton)
             self.setToolTip(self.toolTip() + f"\n开关分支：{len(used)}/{len(branches)} 已占用")
+
+    @staticmethod
+    def scene_arc(path, color):
+        from PySide6.QtWidgets import QGraphicsPathItem
+        arc = QGraphicsPathItem(path); pen = QPen(color, 3); pen.setCapStyle(Qt.PenCapStyle.RoundCap)
+        arc.setPen(pen); arc.setAcceptedMouseButtons(Qt.MouseButton.NoButton)
+        return arc
 
     def itemChange(self, change, value):
         if (change == QGraphicsItem.GraphicsItemChange.ItemPositionChange and self.board_offset is not None
@@ -373,7 +503,7 @@ class PortItem(QGraphicsEllipseItem):
     def mouseDoubleClickEvent(self, event):
         if self.window.is_overview():
             self.window.open_board(self.port["board"])
-        elif not self.window.preview:
+        elif not (self.window.preview or self.window.adjust_button.isChecked()):
             self.window.select_port(self.port["id"]); self.window.edit_assignment()
         event.accept()
 
@@ -382,6 +512,7 @@ class FridgePanel(QWidget):
     def __init__(self, store, parent=None, host=None, preview=False):
         super().__init__(parent); self.store = store; self.host = host; self.selected = None
         self.preview = preview; self.selected_branch = None
+        self.adjust_sources = ()
         self._selection_order = []
         self._closed = False; self._fitting = False; self.placing_port = False
         self.sample_watcher = QFileSystemWatcher(self)
@@ -400,6 +531,8 @@ class FridgePanel(QWidget):
             button = QPushButton(title); menu = QMenu(button)
             self.bind_icon(button, "samples" if title == "样品管理" else "export")
             for name, slot in entries: menu.addAction(name, slot)
+            if title == "导出" and host is not None:
+                menu.addAction("批量导出样品盒接线表", lambda: host.sample_box_panel.export_batch_dialog())
             button.setMenu(menu); button.setEnabled(not preview); top.addWidget(button)
         migrate = QPushButton("迁移旧接线"); migrate.clicked.connect(self.migrate)
         self.bind_icon(migrate, "connect")
@@ -407,6 +540,10 @@ class FridgePanel(QWidget):
         preset = QPushButton("应用线路预设"); preset.clicked.connect(self.apply_preset)
         self.bind_icon(preset, "wiring")
         preset.setEnabled(not preview); top.addWidget(preset)
+        library = QPushButton("元件库")
+        library.clicked.connect(self.manage_components)
+        self.bind_icon(library, "wiring")
+        library.setEnabled(not preview); top.addWidget(library)
         self.check_wiring_button = QPushButton("检查接线类型")
         self.check_wiring_button.setToolTip("核对整个制冷机项目中已分配的端口和开关分支")
         self.check_wiring_button.setEnabled(not preview)
@@ -425,7 +562,10 @@ class FridgePanel(QWidget):
         filters.addWidget(self.search, 1); self.search.textChanged.connect(self.refresh)
         self.legend = QLabel()
         self.legend.setWordWrap(True); self.legend.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
-        self.legend.setProperty("role", "muted"); layout.addWidget(self.legend)
+        self.legend.setProperty("role", "muted")
+        legend_scroll = QScrollArea(); legend_scroll.setWidgetResizable(True); legend_scroll.setWidget(self.legend)
+        legend_scroll.setFrameShape(QScrollArea.Shape.NoFrame); legend_scroll.setMinimumHeight(40); legend_scroll.setMaximumHeight(80)
+        legend_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff); layout.addWidget(legend_scroll)
         canvas_bar = QWidget(); canvas_bar.setObjectName("canvasToolbar")
         canvas_layout = QHBoxLayout(canvas_bar); canvas_layout.setContentsMargins(8, 6, 8, 6)
         self.mode_hint = QLabel(); self.mode_hint.setWordWrap(True)
@@ -439,6 +579,20 @@ class FridgePanel(QWidget):
         self.overview_button = QPushButton("返回总览"); self.overview_button.clicked.connect(lambda: self.board.setCurrentIndex(0))
         self.bind_icon(self.overview_button, "overview")
         canvas_layout.addWidget(self.overview_button)
+        self.overview_circuit_button = QPushButton("查看线路图")
+        self.bind_icon(self.overview_circuit_button, "wiring")
+        self.overview_circuit_button.setToolTip("对照选中端口的低温线路")
+        self.overview_circuit_button.clicked.connect(self.edit_circuit)
+        canvas_layout.addWidget(self.overview_circuit_button)
+        self.adjust_button = QPushButton("快速调整")
+        self.adjust_button.setCheckable(True)
+        self.adjust_button.setToolTip("按选择顺序迁移或交换等量的接线分配")
+        self.bind_icon(self.adjust_button, "wiring")
+        self.adjust_button.toggled.connect(self.adjust_mode_changed)
+        canvas_layout.addWidget(self.adjust_button)
+        self.adjust_next = QPushButton("记录来源")
+        self.adjust_next.clicked.connect(self.adjust_selection)
+        canvas_layout.addWidget(self.adjust_next)
         self.fit_button = QPushButton("适配视图"); self.fit_button.clicked.connect(self.fit_map); canvas_layout.addWidget(self.fit_button)
         self.bind_icon(self.fit_button, "fit")
         layout.addWidget(canvas_bar)
@@ -466,6 +620,10 @@ class FridgePanel(QWidget):
         self.occupied.addItem("未分配", ""); self.occupied.addItem("已占用", "occupied"); self.occupied.addItem("已损坏", "damaged")
         self.occupied.setToolTip("手动标记的占用或损坏端口排除新的分配；已分配样品自动显示为已占用。")
         self.occupied.currentIndexChanged.connect(self.toggle_occupied); inspector_layout.addWidget(self.occupied)
+        self.status_note_button = QPushButton("编辑原因及附件")
+        self.bind_icon(self.status_note_button, "edit")
+        self.status_note_button.clicked.connect(self.edit_status_note)
+        inspector_layout.addWidget(self.status_note_button)
         self.occupied_branch = QComboBox(); self.occupied_branch.currentIndexChanged.connect(self.show_occupied_drawing)
         inspector_layout.addWidget(self.occupied_branch)
         self.branch_occupied = QCheckBox("当前分支手动占用")
@@ -481,8 +639,12 @@ class FridgePanel(QWidget):
         self.port_buttons = []
         for title, slot, symbol in (("分配／编辑", self.edit_assignment, "connect"), ("解除分配", self.unassign, "unlink"), ("查看迁移原记录", self.view_legacy, "history"),
                             ("新增端口", self.add_port, "new"), ("编辑端口", self.edit_port, "edit"),
-                            ("删除端口", self.delete_port, "delete"), ("查看 / 编辑低温线路", self.edit_circuit, "wiring")):
+                            ("删除端口", self.delete_port, "delete")):
             b = QPushButton(title); self.bind_icon(b, symbol); b.clicked.connect(slot); inspector_layout.addWidget(b); self.port_buttons.append(b)
+        self.circuit_button = QPushButton("查看线路图")
+        self.bind_icon(self.circuit_button, "wiring")
+        self.circuit_button.clicked.connect(self.edit_circuit)
+        inspector_layout.addWidget(self.circuit_button)
         inspector_layout.addStretch(); inspector.setMinimumWidth(220); inspector.setMaximumWidth(350)
         splitter.addWidget(inspector); splitter.setSizes([900, 260]); splitter.setStretchFactor(0, 1)
         self.cancel_action = QAction(self)
@@ -501,6 +663,9 @@ class FridgePanel(QWidget):
             if (self.host.fridge_panel is self and self.host.store and self.host.scene and
                     (self.host.field_combo.currentData() or '').startswith('wiring.')):
                 self.host.refresh_scene()
+            if self.host.fridge_panel is self and self.host.store and self.host.selected:
+                self.host.refresh_detail()
+                if self.host.device_popup.isVisible(): self.host.device_popup.reload()
 
     def is_overview(self):
         return not self.board.currentData()
@@ -550,7 +715,7 @@ class FridgePanel(QWidget):
         if board:
             self.grid_choice.setCurrentIndex(self.grid_choice.findData(self.store.board_grid(board)))
         self.grid_choice.setVisible(bool(board))
-        self.grid_choice.setEnabled(bool(board) and not self.preview)
+        self.grid_choice.setEnabled(bool(board) and not self.preview and not self.adjust_button.isChecked())
         self.grid_choice.blockSignals(False)
 
     def change_grid(self, *_):
@@ -560,10 +725,14 @@ class FridgePanel(QWidget):
         QTimer.singleShot(0, self.fit_map)
 
     def update_port_actions(self):
-        editable = not self.preview and not self.is_overview()
+        editable = not (self.preview or self.is_overview() or self.adjust_button.isChecked())
         selected = self.store.port(self.selected) if self.selected else None
-        multiple = len(self.selected_port_ids()) > 1
+        selected_ids = self.selected_port_ids()
+        multiple = len(selected_ids) > 1
         self.occupied.setEnabled(editable and bool(selected))
+        self.status_note_button.setEnabled(editable and bool(selected) and not multiple)
+        attachment_count = selected["status_attachment_count"] if selected and not multiple else 0
+        self.status_note_button.setText(f"编辑原因及附件（{attachment_count}）" if attachment_count else "编辑原因及附件")
         branch = self.occupied_branch.currentData() or ""
         marked = self.store.branch_marks(selected["id"]) if selected else set()
         can_draw = bool(not multiple and selected and selected["manual_status"] != "damaged" and (selected["manually_occupied"] or selected["sample_id"] or branch in marked))
@@ -575,12 +744,76 @@ class FridgePanel(QWidget):
         locked = bool(selected and selected["manually_occupied"])
         enabled = (bool(selected and not locked), bool(selected and selected["sample_id"] and not locked),
                    bool(selected and ((selected["legacy_json"] and selected["legacy_json"] != "{}") or selected["branch_count"])),
-                   True, bool(selected), bool(selected and not locked), bool(selected))
+                   True, bool(selected), bool(selected and not locked))
         for button, allowed in zip(self.port_buttons, enabled):
             button.setEnabled(editable and allowed and (not multiple or button is self.port_buttons[3]))
-        if multiple:
-            removable, _ = self.store.unassign_preview(self.selected_port_ids())
-            self.port_buttons[1].setEnabled(editable and bool(removable))
+        if editable and multiple:
+            removable, _ = self.store.unassign_preview(selected_ids)
+            self.port_buttons[1].setEnabled(bool(removable))
+        self.circuit_button.setEnabled(not self.is_overview() and bool(selected))
+        self.overview_circuit_button.setEnabled(self.is_overview() and bool(selected_ids))
+        self.update_adjustment_controls(selected_ids)
+
+    def adjust_mode_changed(self, active):
+        self.adjust_sources = ()
+        if active:
+            self.cancel_placement()
+            self.views.setCurrentIndex(0)
+        self.sync_grid()
+        self.refresh()
+
+    def update_adjustment_controls(self, selected_ids):
+        active = self.adjust_button.isChecked()
+        can_select = not self.preview and not self.is_overview() and self.views.currentIndex() == 0
+        self.adjust_button.setEnabled(active or can_select)
+        self.adjust_next.setVisible(active)
+        self.adjust_next.setText("预览调整" if self.adjust_sources else "记录来源")
+        ready = len(selected_ids) == len(self.adjust_sources) if self.adjust_sources else bool(selected_ids)
+        self.adjust_next.setEnabled(can_select and ready)
+        if active:
+            if self.adjust_sources:
+                self.mode_hint.setText(f"已记录 {len(self.adjust_sources)} 个来源 · 选择等量目标（已选 {len(selected_ids)}）")
+            else:
+                self.mode_hint.setText(f"快速调整 · 先选择来源端口（已选 {len(selected_ids)}）")
+
+    def adjustment_endpoints(self, ids, source):
+        ports = {port["id"]: port for port in self.store.ports()}
+        selected = []
+        for port_id in ids:
+            port = ports[port_id]
+            endpoints = self.store.allocation_endpoints(port)
+            options = {item.key[1]: item for item in endpoints if not item.blocked and (item.record or not source)}
+            if not options:
+                label = f"{port['board']}{port['number']}"
+                description = "没有可迁移的已分配接线端" if source else "没有可用的目标接线端"
+                QMessageBox.information(self, "快速调整", f"{label} {description}。")
+                return ()
+            if len(options) == 1:
+                selected.append(next(iter(options.values())))
+            else:
+                picker = CircuitDialog(self.store, port, self, branch_options=options)
+                if picker.exec() != QDialog.DialogCode.Accepted:
+                    return ()
+                selected.append(options[picker.chosen_branch])
+        return tuple(selected)
+
+    def adjust_selection(self):
+        if not self.adjust_button.isChecked() or not self.adjust_next.isEnabled():
+            return
+        ids = self.selected_port_ids()
+        if not self.adjust_sources:
+            self.adjust_sources = self.adjustment_endpoints(ids, source=True)
+            if self.adjust_sources:
+                self.scene.clearSelection()
+                self.update_adjustment_controls([])
+            return
+        targets = self.adjustment_endpoints(ids, source=False)
+        if not targets:
+            return
+        dialog = AllocationAdjustmentDialog(self, self.store, self.adjust_sources, targets)
+        if dialog.exec() == QDialog.DialogCode.Accepted:
+            self.refresh_filters()
+            self.adjust_button.setChecked(False)
 
     def perform(self, operation):
         try:
@@ -628,7 +861,7 @@ class FridgePanel(QWidget):
             state = "已损坏" if p["manual_status"] == "damaged" else "已占用" if p["manually_occupied"] or p["sample_id"] or marked else "未分配"
             if self.status.currentData() == "未分配" and p["manually_occupied"]: continue
             if self.status.currentData() and state != self.status.currentData():
-                switch = self.store.circuit(p["id"]).get("switch", [])
+                switch = terminal_branches(self.store.circuit(p["id"]))
                 if not (self.status.currentData() == "未分配" and len({b["branch"] for b in branches} | marked) < len(switch)): continue
             text = " ".join(str(p[k] or "") for k in ("board", "number", "kind", "sample_name", "pin", "drawing", "devices_json"))
             text += " " + " ".join(" ".join(str(b[k] or "") for k in ("branch", "sample_name", "pin", "drawing", "devices_json")) for b in branches)
@@ -647,14 +880,21 @@ class FridgePanel(QWidget):
         self.scene.blockSignals(True)
         ports = list(self.filtered_ports()); self.scene.clear()
         colors = UI_COLORS[self.theme]; diagram = DIAGRAM_COLORS[self.theme]
+        sample_rows = self.store.db.execute("SELECT rowid AS color_index,id,name FROM samples ORDER BY rowid").fetchall()
+        self.sample_colors = {row["id"]: sample_ring_color(row["color_index"], self.theme) for row in sample_rows}
+        names = Counter(row["name"] for row in sample_rows)
         self.scene.setBackgroundBrush(QBrush(QColor(diagram["paper"])))
         swatches = [("XY/Z 线", "XY/Z"), ("直流", "直流"), ("读入", "读取输入"), ("读出", "读取输出")]
         self.legend.setText("端口类型：" + "　".join(
             f"<span style='color:{port_color(kind, self.theme).name()}'>●</span> {label}" for label, kind in swatches)
-            + "　｜　<span style='color:#00B8D9'>◎</span> 亮环：已分配　｜　<span style='color:#C2410C'>●</span> 占：手动已占用　｜　<span style='color:#B91C1C'>●</span> 损：已损坏")
+            + "　｜　亮环按样品区分；多样品为分段亮环，灰色为手动占用分支　｜　<span style='color:#C2410C'>●</span> 占：手动已占用　｜　<span style='color:#B91C1C'>●</span> 损：已损坏"
+            + ("<br>样品：" + "　".join(f"<span style='color:{self.sample_colors[row['id']].name()}'>◎</span> {escape(row['name'])}" +
+                                      (f" · {row['id'][:6]}" if names[row['name']] > 1 else "")
+                                      for row in sample_rows) if sample_rows else ""))
         self.inspector.setVisible(not self.is_overview() or self.views.currentIndex() != 0)
+        self.overview_circuit_button.setVisible(self.is_overview() and self.views.currentIndex() == 0)
         self.mode_hint.setText("新增端口 · 点击格点放置，Esc 取消" if self.placing_port else
-                               "总览只读 · 双击端口进入单盘 · 右键拖动平移，滚轮缩放" if self.is_overview()
+                               "总览只读 · 框选或 Ctrl 多选查看线路 · 双击端口进入单盘" if self.is_overview()
                                else "默认盘位预览 · 左键框选，右键拖动平移，滚轮缩放" if self.preview
                                else f"{self.board.currentText()}盘 · 左键点选、框选或拖动端口 · 右键拖动平移，滚轮缩放")
         self.overview_button.setEnabled(not self.is_overview())
@@ -755,7 +995,7 @@ class FridgePanel(QWidget):
     def show_multiple_selection(self):
         ids = self.selected_port_ids()
         self.info.setText(f"已选择 {len(ids)} 个端口；选择状态可批量设置。")
-        self.circuit_info.setText("批量设置不改变已有样品分配或图纸编号；可点击解除分配批量处理。")
+        self.circuit_info.setText("可查看多路线路图，也可批量设置状态或解除分配。")
         self.occupied.blockSignals(True); self.occupied.setCurrentIndex(-1)
         self.occupied.setPlaceholderText("选择要批量设置的状态"); self.occupied.blockSignals(False)
 
@@ -765,6 +1005,13 @@ class FridgePanel(QWidget):
             status = self.occupied.currentData()
             if status is not None:
                 self.perform(lambda: self.store.set_ports_status(ids, status))
+
+    def edit_status_note(self):
+        port = self.store.port(self.selected)
+        dialog = PortStatusDialog(self, self.store, port)
+        dialog.saved.connect(self.refresh)
+        dialog.exec()
+        dialog.deleteLater()
 
     def show_occupied_drawing(self, *_):
         if not self.selected: return
@@ -786,11 +1033,12 @@ class FridgePanel(QWidget):
             self.perform(lambda: self.store.set_occupied_drawing(self.selected, branch, value))
 
     def show_info(self, p):
+        bias_links = [link for link in self.store.bias_tee_assignments() if p["id"] in (link.rf_port_id, link.dc_port_id)]
         state = "damaged" if p["manual_status"] == "damaged" else "occupied" if p["manually_occupied"] or p["sample_id"] else ""
         self.occupied.blockSignals(True); self.occupied.setCurrentIndex(self.occupied.findData(state)); self.occupied.blockSignals(False)
         current = self.occupied_branch.currentData()
         self.occupied_branch.blockSignals(True); self.occupied_branch.clear(); self.occupied_branch.addItem("端口整体", "")
-        for branch in self.store.circuit(p["id"]).get("switch", []): self.occupied_branch.addItem(f"分支 {branch}", branch)
+        for branch in terminal_branches(self.store.circuit(p["id"])): self.occupied_branch.addItem(f"分支 {branch}", branch)
         self.occupied_branch.setCurrentIndex(max(0, self.occupied_branch.findData(current)))
         self.occupied_branch.blockSignals(False); self.show_occupied_drawing()
         box_cache = {}
@@ -798,8 +1046,8 @@ class FridgePanel(QWidget):
         box, status, devices = direct
         endpoint = f"  样品盒接口：{box['number']} · {status}" if box else (
             f"  {status}" if status else f"  引脚：{p['pin'] or '—'}")
-        switch = self.store.circuit(p["id"]).get("switch", [])
-        title_state = "开关端口" if switch else p['sample_name'] or '空闲'
+        switch = terminal_branches(self.store.circuit(p["id"]))
+        title_state = "开关端口" if switch else p['sample_name'] or ("Bias Tee 关联" if bias_links else "空闲")
         self.info.setText(f"{p['board']} 盘 {p['number']} · {display_line_type(p['kind'])} · {title_state}"
                           + ("（样品不可用）" if p['sample_id'] and not self.store.sample_path(p['sample_id']).is_file() else "")
                           + (f" · {len({r['branch'] for r in self.store.branch_assignments(p['id'])} | self.store.branch_marks(p['id']))}/{len(switch)} 已占用" if switch else
@@ -807,6 +1055,13 @@ class FridgePanel(QWidget):
         circuit = self.store.circuit(p["id"])
         components = circuit.get("components", [])
         lines = []
+        if bias_links:
+            ports = {row["id"]: row for row in self.store.ports()}
+            lines.extend(link.description(p["id"], ports) for link in bias_links)
+        if p["status_note"]:
+            lines.append(f"占用／损坏原因：{p['status_note']}")
+        if p["notes"]:
+            lines.append(f"备注：{p['notes']}")
         if box:
             lines.append(self.box_description(box))
         for device in devices:
@@ -814,16 +1069,24 @@ class FridgePanel(QWidget):
                 lines.append(f"{device['label']} 图纸编号：{device.get('drawing_number') or '未填写'}" + (f"（{device['status']}）" if device.get("status") else ""))
         assigned = {r["branch"]: r for r in self.store.branch_assignments(p["id"])}
         marked = self.store.branch_marks(p["id"])
-        branches = circuit.get("switch", [])
+        branches = terminal_branches(circuit)
+        branch_components = circuit.get("branch_components", {})
         if branches: lines.insert(0, f"开关分支：{len(set(assigned) | marked)}/{len(branches)} 已占用")
         for name in branches:
             branch = assigned.get(name)
             state = "整端口已损坏" if p["manual_status"] == "damaged" else "整端口已占用" if p["manually_occupied"] else "手动占用" if name in marked else "已分配" if branch else "未分配"
             drawing = json.loads(p["occupied_drawings"]).get(name, "")
+            specific = branch_components.get(name, [])
+            path = [f"  {c.get('stage') or '温级未登记'} · {component_text(c)}" for c in specific]
             if not branch:
-                lines.append(f"分支 {name} · {state}" + (f" · 图纸：{drawing}" if drawing else "")); continue
+                lines.append(f"分支 {name} · {state}" + (f" · 图纸：{drawing}" if drawing else ""))
+                lines.extend(path)
+                continue
             missing = "（样品不可用）" if not self.store.sample_path(branch["sample_id"]).is_file() else ""
             lines.append(f"分支 {name} · {state} · {branch['sample_name']}{missing} · {display_line_type(branch['usage'])}" + (f" · 图纸：{drawing}" if drawing else ""))
+            if branch["notes"]:
+                lines.append(f"  备注：{branch['notes']}")
+            lines.extend(path)
             box, status, devices = self.store.resolve_assignment(branch, box_cache)
             if box or status:
                 lines.append(f"  {self.box_description(box) + ' · ' if box else ''}{status}")
@@ -833,7 +1096,7 @@ class FridgePanel(QWidget):
         for stage in dict.fromkeys(["3 K", "STILL", "50 mK", "MC"] + [c.get("stage", "") for c in components]):
             values = [component_text(c) for c in components if c.get("stage") == stage]
             if values: lines.append(f"{stage}  {' · '.join(values)}")
-        if circuit.get("switch"): lines.append("微波开关  " + " / ".join(circuit["switch"]))
+        if branches: lines.append("微波开关  " + "、".join(branches))
         self.circuit_info.setText("\n".join(lines) if lines else "低温线路：未登记")
 
     @staticmethod
@@ -923,7 +1186,7 @@ class FridgePanel(QWidget):
             self.perform(lambda: self.store.remove_sample(sample["id"]))
 
     def edit_assignment(self):
-        if self.preview or self.is_overview(): return
+        if self.preview or self.is_overview() or self.adjust_button.isChecked(): return
         p = self.chosen()
         if not p: return
         if p["manually_occupied"]:
@@ -975,11 +1238,18 @@ class FridgePanel(QWidget):
             self.perform(lambda: self.store.unassign(p["id"], branch))
 
     def choose_branch(self, port, assigned_only=False):
-        branches = self.store.circuit(port["id"]).get("switch", [])
+        circuit = self.store.circuit(port["id"])
+        branches = terminal_branches(circuit)
         if not branches: return None
         assigned = {r["branch"]: r for r in self.store.branch_assignments(port["id"])}
         marked = self.store.branch_marks(port["id"])
         options = [branch for branch in branches if branch not in marked and (not assigned_only or branch in assigned)]
+        if circuit.get("merge_switches"):
+            if not options:
+                QMessageBox.information(self, "选择接线端", "当前没有可选的末端分支或公共输出。")
+                return None
+            dialog = CircuitDialog(self.store, port, self, branch_options=options, initial_branch=self.selected_branch)
+            return dialog.chosen_branch if dialog.exec() == QDialog.DialogCode.Accepted else None
         if not options: return None
         if self.selected_branch in options: return self.selected_branch
         labels = [f"{branch} · {assigned[branch]['sample_name']}" if branch in assigned else f"{branch} · 空闲" for branch in options]
@@ -987,10 +1257,20 @@ class FridgePanel(QWidget):
         return options[labels.index(label)] if ok else None
 
     def edit_circuit(self):
-        if self.preview or self.is_overview(): return
-        p = self.chosen()
-        if p and CircuitDialog(self.store, p, self).exec() == QDialog.DialogCode.Accepted:
+        overview = self.is_overview()
+        ids = self.selected_port_ids()
+        if not ids and not overview and self.selected:
+            ids = [self.selected]
+        if not ids:
+            return
+        first, *others = [self.store.port(port_id) for port_id in ids]
+        dialog = CircuitDialog(self.store, first, self, others=others, read_only=overview or self.preview,
+                               initial_branch=self.selected_branch or self.occupied_branch.currentData())
+        if dialog.exec() == QDialog.DialogCode.Accepted and dialog.editable:
             self.refresh_filters(); self.refresh()
+
+    def manage_components(self):
+        ComponentLibraryDialog(self.store, self).exec()
 
     def apply_preset(self):
         if self.preview: return
@@ -1133,7 +1413,7 @@ class FridgePanel(QWidget):
         table.setHorizontalHeaderLabels(["迁移", "原盘号", "原端口", "用途", "目标端口", "说明", "关联器件", "开关分支"])
         available = [p for p in self.store.ports() if not p["manually_occupied"] and (
                      (not self.store.circuit(p["id"]).get("switch") and not p["sample_id"]) or
-                     (set(self.store.circuit(p["id"]).get("switch", [])) - {b["branch"] for b in self.store.branch_assignments(p["id"])} - self.store.branch_marks(p["id"])))]
+                     (set(terminal_branches(self.store.circuit(p["id"]))) - {b["branch"] for b in self.store.branch_assignments(p["id"])} - self.store.branch_marks(p["id"])))]
         for row, item in enumerate(preview):
             check = QTableWidgetItem(); check.setFlags(check.flags() | Qt.ItemFlag.ItemIsUserCheckable)
             check.setCheckState(Qt.CheckState.Checked if item["reason"] == "可迁移" else Qt.CheckState.Unchecked)
@@ -1152,7 +1432,7 @@ class FridgePanel(QWidget):
                 port_id = source.currentData()
                 if not port_id: return
                 used = {r["branch"] for r in self.store.branch_assignments(port_id)} | self.store.branch_marks(port_id)
-                for branch in self.store.circuit(port_id).get("switch", []):
+                for branch in terminal_branches(self.store.circuit(port_id)):
                     if branch not in used: target.addItem(branch, branch)
             choice.currentIndexChanged.connect(update_branches); update_branches()
         table.resizeColumnsToContents(); buttons(dialog, layout, "迁移所选")

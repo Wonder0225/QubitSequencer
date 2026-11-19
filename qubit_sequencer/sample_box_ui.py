@@ -1,5 +1,11 @@
 """Graphic front-panel view for a chip's sample box."""
 
+import os
+import re
+import sqlite3
+import tempfile
+import zipfile
+from dataclasses import dataclass
 from pathlib import Path
 
 from PySide6.QtCore import QPointF, QRectF, QSize, QStandardPaths, Qt, QUrl
@@ -7,11 +13,13 @@ from PySide6.QtGui import QColor, QBrush, QDesktopServices, QFont, QFontMetrics,
 from PySide6.QtSvg import QSvgGenerator
 from PySide6.QtWidgets import (
     QCheckBox, QComboBox, QDialog, QDialogButtonBox, QFileDialog, QFormLayout, QGraphicsItem, QGraphicsScene,
-    QHBoxLayout, QLabel, QLineEdit, QMenu, QMessageBox, QPushButton, QSplitter, QVBoxLayout, QWidget,
+    QHBoxLayout, QLabel, QLineEdit, QListWidget, QListWidgetItem, QMenu, QMessageBox, QPushButton, QSplitter,
+    QVBoxLayout, QWidget,
 )
 
 from .device_types import DEVICE_NAMES
-from .exports import export_sample_box_wiring
+from .exports import (export_sample_box_wiring, export_sample_box_wiring_matrix,
+                      export_sample_box_wiring_pdf, sample_box_wiring_blocks)
 from .fridge_circuit_ui import component_text
 from .fridge_ui import PortView
 from .sample_box_store import BOX_ROLES, box_connection_label, box_number_source
@@ -24,6 +32,84 @@ from .ui_icons import icon
 def sample_box_template_directory():
     root = QStandardPaths.writableLocation(QStandardPaths.StandardLocation.GenericDataLocation)
     return Path(root) / "QubitSequencer" / "sample-box-templates"
+
+
+def wiring_export_stem(sample_name):
+    name = re.sub(r'[<>:"/\\|?*\x00-\x1f]', "-", sample_name).strip(" .")
+    return f"接线表-{name}" if name else "接线表"
+
+
+@dataclass(frozen=True)
+class SampleBoxDiagram:
+    name: str
+    appearance: dict
+    ports: dict
+    connections: dict
+    connection_state: str
+    connections_available: bool
+    rotation: int
+    custom_subtypes: list
+
+
+class BatchWiringExportDialog(QDialog):
+    def __init__(self, fridge, parent):
+        super().__init__(parent)
+        self.setWindowTitle("批量导出样品盒接线表")
+        self.resize(550, 390)
+        layout = QVBoxLayout(self)
+        title = QLabel(f"制冷机：{fridge.name()}")
+        title.setTextFormat(Qt.TextFormat.PlainText)
+        layout.addWidget(title)
+        self.samples = QListWidget()
+        for sample in fridge.samples():
+            ident = sample["id"]
+            path = fridge.sample_path(ident)
+            state = ""
+            if not path.is_file():
+                state = "样品文件不可用"
+            elif not fridge.box_connections(ident):
+                state = "没有已分配的样品盒接线"
+            label = f"{sample['name']} · {path.name}"
+            item = QListWidgetItem(f"{label} · {state}" if state else label, self.samples)
+            item.setToolTip(str(path))
+            if state:
+                item.setFlags(item.flags() & ~Qt.ItemFlag.ItemIsEnabled)
+            else:
+                item.setData(Qt.ItemDataRole.UserRole, ident)
+                item.setCheckState(Qt.CheckState.Checked)
+        layout.addWidget(self.samples, 1)
+        selection = QHBoxLayout()
+        for text, checked in (("全选", True), ("全不选", False)):
+            button = QPushButton(text)
+            button.clicked.connect(lambda _, enabled=checked: self.set_selected(enabled))
+            selection.addWidget(button)
+        selection.addStretch()
+        layout.addLayout(selection)
+        form = QFormLayout()
+        self.formats = QComboBox()
+        for label, formats in (("PDF", ("pdf",)), ("Excel", ("xlsx",)), ("Excel 和 PDF", ("xlsx", "pdf"))):
+            self.formats.addItem(label, formats)
+        form.addRow("导出格式", self.formats)
+        layout.addLayout(form)
+        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Save | QDialogButtonBox.StandardButton.Cancel)
+        self.save = buttons.button(QDialogButtonBox.StandardButton.Save)
+        self.save.setText("选择导出目录")
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        self.samples.itemChanged.connect(lambda _: self.save.setEnabled(bool(self.sample_ids())))
+        self.save.setEnabled(bool(self.sample_ids()))
+        layout.addWidget(buttons)
+
+    def sample_ids(self):
+        return [item.data(Qt.ItemDataRole.UserRole) for index in range(self.samples.count())
+                if (item := self.samples.item(index)).checkState() == Qt.CheckState.Checked]
+
+    def set_selected(self, checked):
+        state = Qt.CheckState.Checked if checked else Qt.CheckState.Unchecked
+        for index in range(self.samples.count()):
+            item = self.samples.item(index)
+            if item.flags() & Qt.ItemFlag.ItemIsEnabled:
+                item.setCheckState(state)
 
 
 def _fit_label(label, width, height):
@@ -139,8 +225,11 @@ class SampleBoxPanel(QWidget):
         self.export_button.setIcon(icon("export", UI_COLORS[self.host.theme]["text"]))
         self.host._icon_bindings.append((self.export_button, "export"))
         export_menu = QMenu(self.export_button)
-        export_menu.addAction("导出样品盒图片", self.export_dialog)
-        export_menu.addAction("导出接线表", self.export_table_dialog)
+        image_action = export_menu.addAction("导出样品盒图片", self.export_dialog)
+        table_action = export_menu.addAction("导出接线表", self.export_table_dialog)
+        self.batch_export_action = export_menu.addAction("批量导出接线表", self.export_batch_dialog)
+        bundle_action = export_menu.addAction("接线大礼包", self.export_bundle_dialog)
+        self.single_export_actions = (image_action, table_action, bundle_action)
         self.export_button.setMenu(export_menu)
         bar.addWidget(self.export_button)
 
@@ -176,7 +265,7 @@ class SampleBoxPanel(QWidget):
         self.update_template_action()
         self.search.setEnabled(bool(self.ports)); self.fit.setEnabled(bool(self.ports))
         self.rotate_left.setEnabled(bool(self.ports)); self.rotate_right.setEnabled(bool(self.ports))
-        self.display_button.setEnabled(bool(self.ports)); self.export_button.setEnabled(bool(self.ports))
+        self.display_button.setEnabled(bool(self.ports))
         self.refresh_connections()
         if old_store is not self.store or self.view._fit_active:
             self.fit_map()
@@ -186,7 +275,12 @@ class SampleBoxPanel(QWidget):
         self.connection_state = "未打开制冷机项目"
         self.connections_available = False
         fridge = self.host.fridge_panel
-        if self.store and fridge and not fridge.preview:
+        batch_available = fridge is not None and not fridge.preview
+        self.batch_export_action.setEnabled(batch_available)
+        self.export_button.setEnabled(bool(self.ports) or batch_available)
+        for action in self.single_export_actions:
+            action.setEnabled(bool(self.ports))
+        if self.store and batch_available:
             self.connection_state = "当前样品未关联到制冷机项目"
             path = self.store.path.resolve()
             sample = next((s for s in fridge.store.samples() if fridge.store.sample_path(s["id"]) == path), None)
@@ -208,32 +302,51 @@ class SampleBoxPanel(QWidget):
     def draw_panel(self):
         selected_ids = {item.data(0) for item in self.scene.selectedItems() if item.data(0)}
         self.scene.blockSignals(True)
-        self.scene.clear(); self.items.clear()
+        self.scene.clear()
+        self.items = self._populate_scene(
+            self.scene, smart_wiring=self.smart_wiring.isChecked(), show_names=self.show_names.isChecked(),
+            hide_unassigned=self.connections_available and self.hide_unassigned.isChecked(),
+        )
+        for ident in selected_ids or {self.selected}:
+            if ident in self.items:
+                self.items[ident].setSelected(True)
+        if self.selected not in self.items:
+            self.selected = None
+        self.scene.blockSignals(False)
+        self.scene.setSceneRect(self.scene.itemsBoundingRect().adjusted(-18, -18, 18, 18))
+
+    def _current_diagram(self):
+        return SampleBoxDiagram(self.store.meta()["chip_name"], self.appearance, self.ports, self.connections,
+                                self.connection_state, self.connections_available, self.rotation,
+                                [device["subtype"] for device in self.store.devices("custom")])
+
+    def _populate_scene(self, scene, *, smart_wiring, show_names, hide_unassigned, only_connected_captions=False,
+                        diagram=None):
+        items = {}
         theme = self.host.theme
         colors = DIAGRAM_COLORS[theme]; ui = UI_COLORS[theme]
-        self.scene.setBackgroundBrush(QColor(colors["paper"]))
-        if self.ports:
-            drawing = self.appearance["drawing"]
+        scene.setBackgroundBrush(QColor(colors["paper"]))
+        if diagram is None and self.ports:
+            diagram = self._current_diagram()
+        if diagram is not None:
+            drawing = diagram.appearance["drawing"]
             vertices = drawing["outline"]
             outline = QPainterPath(QPointF(*vertices[0]))
             for x, y in vertices[1:]:
                 outline.lineTo(x, y)
             outline.closeSubpath()
             center = outline.boundingRect().center()
-            smart_wiring = self.smart_wiring.isChecked()
-            show_names = self.show_names.isChecked()
-            hide_unassigned = self.connections_available and self.hide_unassigned.isChecked()
             spread = 1.65 if smart_wiring else 1.0
-            rotation = QTransform().translate(center.x(), center.y()).rotate(self.rotation).scale(spread, spread).translate(-center.x(), -center.y())
+            rotation = QTransform().translate(center.x(), center.y()).rotate(diagram.rotation).scale(spread, spread).translate(-center.x(), -center.y())
             outline = rotation.map(outline)
-            self.scene.addPath(outline, QPen(QColor(ui["border"]), 2), QBrush(QColor(ui["panel"])))
+            scene.addPath(outline, QPen(QColor(ui["border"]), 2), QBrush(QColor(ui["panel"])))
             if drawing["cover"]:
                 cover = QPainterPath(); cover.addRect(*drawing["cover"])
-                self.scene.addPath(rotation.map(cover), QPen(QColor(ui["border"]), 2), QBrush(QColor(ui["toolbar"])))
+                scene.addPath(rotation.map(cover), QPen(QColor(ui["border"]), 2), QBrush(QColor(ui["toolbar"])))
             for x, y, radius in drawing["holes"]:
                 point = rotation.map(QPointF(x, y)); x, y = point.x(), point.y()
-                self.scene.addEllipse(x-radius, y-radius, radius*2, radius*2,
-                                      QPen(QColor(ui["border"])), QBrush(QColor(colors["paper"])))
+                scene.addEllipse(x-radius, y-radius, radius*2, radius*2,
+                                 QPen(QColor(ui["border"])), QBrush(QColor(colors["paper"])))
             origin_x, origin_y = drawing["origin"]
             pitch, radius = drawing["pitch"], drawing["radius"]
             # Rotation is in 90-degree steps, so the grid spacing applies on both axes.
@@ -243,12 +356,12 @@ class SampleBoxPanel(QWidget):
             caption_bottom = spacing - radius - gap
             fill = {"qubit": colors["x_check"], "coupler": colors["coupler"], "readout": colors["data"],
                     "filter": colors["z_check"]}
-            custom_colors = custom_device_colors(device["subtype"] for device in self.store.devices("custom"))
-            for ident, port in self.ports.items():
-                connection = self.connections.get(ident)
+            custom_colors = custom_device_colors(diagram.custom_subtypes)
+            for ident, port in diagram.ports.items():
+                connection = diagram.connections.get(ident)
                 if hide_unassigned and connection is None:
                     continue
-                empty_port = (smart_wiring and self.connections_available
+                empty_port = (smart_wiring and diagram.connections_available
                               and connection is None and not port["device_id"])
                 x, y = origin_x + port["x"] * pitch, origin_y + port["y"] * pitch
                 point = rotation.map(QPointF(x, y)); x, y = point.x(), point.y()
@@ -257,18 +370,19 @@ class SampleBoxPanel(QWidget):
                 subtype = port["device_subtype"] if port["device_kind"] == "custom" else ""
                 color = custom_colors[subtype] if subtype else fill.get(port["device_kind"], colors["paper"])
                 number_color = "#15181E" if port["device_kind"] else colors["ink"]
-                if empty_port:
+                if only_connected_captions and connection is None:
+                    color, number_color = colors["paper"], colors["ink"]
+                elif empty_port:
                     color = DIAGRAM_COLORS["dark"]["paper"]
                     number_color = DIAGRAM_COLORS["dark"]["ink"]
                 brush = QBrush(QColor(color))
-                item = self.scene.addEllipse(-radius, -radius, radius*2, radius*2, pen, brush)
+                item = scene.addEllipse(-radius, -radius, radius*2, radius*2, pen, brush)
                 item.setPos(x, y); item.setData(0, ident)
                 item.setFlag(QGraphicsItem.GraphicsItemFlag.ItemIsSelectable)
-                item.setSelected(ident in selected_ids if selected_ids else ident == self.selected)
                 name = port["device_label"] or ""
                 item.setToolTip(f"接口 {port['number']} · {box_number_source(port)}" + (f"\n关联元件：{name}" if name else "")
                                 + (f"\n类型：{subtype}" if subtype else ""))
-                label = self.scene.addSimpleText(port["number"]); label.setParentItem(item)
+                label = scene.addSimpleText(port["number"]); label.setParentItem(item)
                 label.setBrush(QColor(number_color))
                 label.setAcceptedMouseButtons(Qt.MouseButton.NoButton)
                 number_bounds = label.boundingRect()
@@ -279,7 +393,7 @@ class SampleBoxPanel(QWidget):
                 caption_top = radius + gap
                 if name and show_names:
                     if smart_wiring:
-                        caption = self.scene.addSimpleText(name); caption.setParentItem(item)
+                        caption = scene.addSimpleText(name); caption.setParentItem(item)
                         name_height = (caption_bottom - caption_top - gap) / 2
                         width, height = _fit_label(caption, caption_width, name_height)
                         caption.setPos(-width / 2, caption_top)
@@ -287,19 +401,19 @@ class SampleBoxPanel(QWidget):
                     else:
                         font = QFont(); font.setPixelSize(max(8, min(11, int(pitch - 2 * radius - 3))))
                         text = QFontMetrics(font).elidedText(name, Qt.TextElideMode.ElideRight, max(1, int(pitch - 4)))
-                        caption = self.scene.addSimpleText(text); caption.setParentItem(item); caption.setFont(font)
+                        caption = scene.addSimpleText(text); caption.setParentItem(item); caption.setFont(font)
                         caption.setPos(-caption.boundingRect().width() / 2, radius + 1)
                     caption.setBrush(QColor(colors["ink"])); caption.setToolTip(name)
                     caption.setAcceptedMouseButtons(Qt.MouseButton.NoButton)
-                self.items[ident] = item
-                if smart_wiring and not empty_port:
+                items[ident] = item
+                if smart_wiring and not empty_port and (connection or not only_connected_captions):
                     if connection:
                         target = box_connection_label(connection)
                     else:
-                        target = "未分配" if self.connections_available else "未知"
+                        target = "未分配" if diagram.connections_available else "未知"
                     item.setToolTip(item.toolTip() + f"\n制冷机：{target}")
                     font = QFont(); font.setBold(bool(connection))
-                    caption = self.scene.addSimpleText(target); caption.setParentItem(item); caption.setFont(font)
+                    caption = scene.addSimpleText(target); caption.setParentItem(item); caption.setFont(font)
                     caption.setBrush(QColor(ui["text"] if connection else ui["muted"]))
                     caption.setAcceptedMouseButtons(Qt.MouseButton.NoButton)
                     caption.setToolTip(f"制冷机端口：{target}")
@@ -307,14 +421,17 @@ class SampleBoxPanel(QWidget):
                     caption.setPos(-width / 2, caption_top)
             if smart_wiring:
                 bounds = outline.boundingRect()
-                heading = self.scene.addSimpleText(f"智能接线 · {self.store.meta()['chip_name']} · {self.connection_state}")
+                heading = scene.addSimpleText(f"智能接线 · {diagram.name} · {diagram.connection_state}")
                 font = heading.font(); font.setPixelSize(16); font.setBold(True); heading.setFont(font)
                 heading.setBrush(QColor(ui["text"])); heading.setPos(bounds.left(), bounds.top() - 35)
                 heading.setAcceptedMouseButtons(Qt.MouseButton.NoButton)
-        if self.selected not in self.items:
-            self.selected = None
-        self.scene.blockSignals(False)
-        self.scene.setSceneRect(self.scene.itemsBoundingRect().adjusted(-18, -18, 18, 18))
+        return items
+
+    def _wiring_appendix(self, diagram=None):
+        scene = QGraphicsScene()
+        self._populate_scene(scene, smart_wiring=True, show_names=False, hide_unassigned=False,
+                             only_connected_captions=True, diagram=diagram)
+        return scene
 
     def rotate_box(self, delta):
         if self.ports:
@@ -331,21 +448,173 @@ class SampleBoxPanel(QWidget):
         except (OSError, ValueError) as exc:
             QMessageBox.warning(self, "导出失败", str(exc))
 
+    def wiring_export_directory(self):
+        panel = self.host.fridge_panel
+        if panel is None or panel.preview:
+            return self.store.path.resolve().parent
+        fridge = panel.store
+        directories = [fridge.sample_path(sample["id"]).parent for sample in fridge.samples()]
+        if directories:
+            try:
+                shared = Path(os.path.commonpath(directories))
+            except ValueError:  # Linked samples may be on different drives.
+                pass
+            else:
+                if shared.parent != shared and shared.is_dir():
+                    return shared
+        return fridge.path.resolve().parent
+
     def export_table_dialog(self):
-        path, selected = QFileDialog.getSaveFileName(self, "导出接线表", "样品盒接线表.xlsx", "Excel (*.xlsx);;CSV (*.csv)")
+        sample_name = self.store.meta()["chip_name"]
+        suggested = self.wiring_export_directory() / f"{wiring_export_stem(sample_name)}.pdf"
+        filters = {"PDF 文档 (*.pdf)": ".pdf", "Excel (*.xlsx)": ".xlsx", "CSV (*.csv)": ".csv"}
+        path, selected = QFileDialog.getSaveFileName(self, "导出接线表", str(suggested), ";;".join(filters))
         if not path:
             return
-        if not Path(path).suffix:
-            path += ".csv" if "CSV" in selected else ".xlsx"
+        path = Path(path)
+        if path.suffix.lower() not in filters.values():
+            path = path.with_name(path.name + filters.get(selected, ".pdf"))
         try:
-            export_sample_box_wiring(self.store, path, self.connections)
+            if path.suffix.lower() == ".pdf":
+                connections = {ident: record for ident, record in self.connections.items() if ident in self.ports}
+                blocks = sample_box_wiring_blocks(self.ports, connections, combine_readout_plates=True)
+                export_sample_box_wiring_pdf(path, blocks, sample_name=sample_name, diagram_scene=self._wiring_appendix())
+            elif path.suffix.lower() == ".xlsx":
+                with tempfile.TemporaryDirectory() as directory:
+                    diagram = Path(directory) / "diagram.png"
+                    self.export_scene(diagram, scene=self._wiring_appendix())
+                    export_sample_box_wiring(self.store, path, self.connections, diagram_image=diagram)
+            else:
+                export_sample_box_wiring(self.store, path, self.connections)
         except (OSError, ValueError) as exc:
             QMessageBox.warning(self, "导出失败", str(exc))
 
-    def export_scene(self, path):
+    def export_batch_dialog(self):
+        panel = self.host.fridge_panel
+        if panel is None or panel.preview:
+            return
+        fridge = panel.store
+        if not fridge.samples():
+            QMessageBox.information(self, "批量导出接线表", "当前制冷机项目尚未关联样品。")
+            return
+        dialog = BatchWiringExportDialog(fridge, self)
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+        directory = QFileDialog.getExistingDirectory(self, "选择接线表导出目录", str(self.wiring_export_directory()))
+        if not directory:
+            return
+        try:
+            written, failures = self.export_batch_tables(fridge, dialog.sample_ids(), Path(directory),
+                                                         dialog.formats.currentData())
+        except OSError as exc:
+            QMessageBox.warning(self, "批量导出失败", str(exc))
+            return
+        message = f"已导出 {len(written)} 个文件到\n{directory}"
+        if failures:
+            report = QMessageBox(QMessageBox.Icon.Warning, "批量导出结果",
+                                 f"{message}\n{len(failures)} 个样品导出失败。", parent=self)
+            report.setDetailedText("\n".join(failures))
+            report.exec()
+        else:
+            QMessageBox.information(self, "批量导出完成", message)
+
+    def export_batch_tables(self, fridge, sample_ids, directory, formats):
+        occupied = {path.name.casefold() for path in directory.iterdir()}
+        written, failures = [], []
+        current_path = self.store.path.resolve() if self.store else None
+        fridge_name = fridge.name()
+        with tempfile.TemporaryDirectory(dir=directory) as scratch:
+            for ident in sample_ids:
+                sample_name = fridge.sample(ident)["name"]
+                try:
+                    sample_name, appearance, box_ports, subtypes = fridge.read_sample_box(ident)
+                    ports = {port["id"]: port for port in box_ports}
+                    connections = {row["box_port_id"]: row for row in fridge.box_connections(ident)
+                                   if row["box_port_id"] in ports}
+                    if not connections:
+                        raise ValueError("没有有效的样品盒接线")
+                    state = f"制冷机：{fridge_name} · 已连接 {len(connections)} 个接口"
+                    rotation = self.rotation if fridge.sample_path(ident) == current_path else 0
+                    diagram = SampleBoxDiagram(sample_name, appearance, ports, connections, state, True,
+                                              rotation, subtypes)
+                    base = wiring_export_stem(sample_name)
+                    stem = base
+                    index = 2
+                    while any(f"{stem}.{ext}".casefold() in occupied for ext in formats):
+                        stem = f"{base} ({index})"
+                        index += 1
+                    files = self._export_wiring_documents(Path(scratch), stem, diagram, formats)
+                    for file in files:
+                        target = directory / file.name
+                        file.rename(target)
+                        occupied.add(file.name.casefold())
+                        written.append(target)
+                except (OSError, sqlite3.Error, ValueError) as exc:
+                    failures.append(f"{sample_name} · {exc}")
+        return written, failures
+
+    def export_bundle_dialog(self):
+        if not self.connections_available or not self.connections.keys() & self.ports.keys():
+            message = self.connection_state if not self.connections_available else "当前样品盒没有已分配的接线。"
+            QMessageBox.information(self, "接线大礼包", message)
+            return
+        sample_name = self.store.meta()["chip_name"]
+        file_name = re.sub(r'[<>:"/\\|?*\x00-\x1f]', "-", sample_name).strip()
+        default_name = f"{file_name}-接线大礼包.zip" if file_name else "接线大礼包.zip"
+        path, _ = QFileDialog.getSaveFileName(self, "接线大礼包", default_name, "ZIP 压缩文件 (*.zip)")
+        if not path:
+            return
+        if Path(path).suffix.lower() != ".zip":
+            path += ".zip"
+        try:
+            self.export_bundle(path)
+        except (OSError, ValueError) as exc:
+            QMessageBox.warning(self, "导出失败", str(exc))
+
+    def export_bundle(self, path):
+        target = Path(path)
+        if target.suffix.lower() != ".zip":
+            raise ValueError("请选择 ZIP 格式")
+        connections = {ident: self.connections[ident] for ident in self.ports if ident in self.connections}
+        if not connections:
+            raise ValueError("当前样品盒没有已分配的接线。")
+        with tempfile.TemporaryDirectory(dir=target.parent) as directory:
+            root = Path(directory)
+            staged = root / "bundle.zip"
+            with zipfile.ZipFile(staged, "w", zipfile.ZIP_DEFLATED) as archive:
+                for filename, show_names in (("样品盒接线图-含元件名.png", True), ("样品盒接线图-仅端口.png", False)):
+                    scene = QGraphicsScene()
+                    self._populate_scene(scene, smart_wiring=True, show_names=show_names, hide_unassigned=True)
+                    self.export_scene(root / filename, scene=scene)
+                    archive.write(root / filename, filename)
+                diagram = self._current_diagram()
+                for file in self._export_wiring_documents(root, "接线表", diagram, ("xlsx", "pdf")):
+                    archive.write(file, file.name)
+            staged.replace(target)
+
+    def _export_wiring_documents(self, directory, stem, diagram, formats):
+        connections = {ident: record for ident, record in diagram.connections.items() if ident in diagram.ports}
+        scene = self._wiring_appendix(diagram)
+        files = []
+        if "xlsx" in formats:
+            image = directory / "diagram.png"
+            self.export_scene(image, scene=scene)
+            workbook = directory / f"{stem}.xlsx"
+            blocks = list(sample_box_wiring_blocks(diagram.ports, connections))
+            export_sample_box_wiring_matrix(workbook, blocks, sample_name=diagram.name, diagram_image=image)
+            files.append(workbook)
+        if "pdf" in formats:
+            pdf = directory / f"{stem}.pdf"
+            blocks = sample_box_wiring_blocks(diagram.ports, connections, combine_readout_plates=True)
+            export_sample_box_wiring_pdf(pdf, blocks, sample_name=diagram.name, diagram_scene=scene)
+            files.append(pdf)
+        return files
+
+    def export_scene(self, path, *, scene=None):
+        scene = self.scene if scene is None else scene
         path = Path(path); suffix = path.suffix.lower()
         if suffix not in (".png", ".svg", ".pdf"): raise ValueError("请选择 PNG、SVG 或 PDF 格式")
-        bounds = self.scene.itemsBoundingRect().adjusted(-20, -20, 20, 20)
+        bounds = scene.itemsBoundingRect().adjusted(-20, -20, 20, 20)
         if bounds.isEmpty(): raise ValueError("没有可导出的样品盒图面")
         width = 2400; height = max(1, round(width * bounds.height() / bounds.width()))
         if suffix == ".svg":
@@ -356,18 +625,18 @@ class SampleBoxPanel(QWidget):
             device.setPageOrientation(orientation); device.setPageSize(QPageSize(QPageSize.PageSizeId.A4))
         else:
             device = QImage(width, height, QImage.Format.Format_ARGB32); device.fill(QColor(DIAGRAM_COLORS[self.host.theme]["paper"]))
-        selected = self.scene.selectedItems(); self.scene.blockSignals(True)
+        selected = scene.selectedItems(); scene.blockSignals(True)
         for item in selected: item.setSelected(False)
         try:
             painter = QPainter(device)
             if not painter.isActive(): raise OSError(f"无法写入 {path}")
             painter.setRenderHint(QPainter.RenderHint.Antialiasing)
             target = QRectF(0, 0, device.width(), device.height())
-            self.scene.render(painter, target, bounds, Qt.AspectRatioMode.KeepAspectRatio); painter.end()
+            scene.render(painter, target, bounds, Qt.AspectRatioMode.KeepAspectRatio); painter.end()
             if suffix == ".png" and not device.save(str(path), "PNG"): raise OSError(f"无法写入 {path}")
         finally:
             for item in selected: item.setSelected(True)
-            self.scene.blockSignals(False)
+            scene.blockSignals(False)
 
     def fit_if_active(self):
         if self.view._fit_active:
